@@ -9,18 +9,24 @@ import {
   Sparkles,
   Info,
   BookOpen,
+  AlertTriangle,
 } from 'lucide-react';
 import { Course } from '../../types/course';
 import { Badge } from '../../components/common/Badge';
 import { Button } from '../../components/common/Button';
 import { CounsellingLanguage } from './counsellingContent';
 import { courseService, EDUCATION_LEVEL_LABELS } from '../../services/courses/courseService';
+import { ConsensusRecommendation } from '../../services/api/familyConsensusService';
 
 export interface EvidencePanelProps {
   course?: Course | null;
   language: CounsellingLanguage;
   onExploreCourses: () => void;
   onViewCourseDetails?: (courseId: string) => void;
+  /** RAG-sourced pathway recommendations from POST /families/{id}/analyze.
+   *  When provided, each recommendation's missing_evidence_flags are surfaced
+   *  as amber warning badges beneath the student / parent rationale text. */
+  consensusRecommendations?: ConsensusRecommendation[];
 }
 
 export const EvidencePanel: React.FC<EvidencePanelProps> = ({
@@ -28,9 +34,69 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   language,
   onExploreCourses,
   onViewCourseDetails,
+  consensusRecommendations,
 }) => {
   const isMr = language === 'mr';
   const isHi = language === 'hi';
+
+  /** Renders amber RAG data-gap badges for a single recommendation's missing_evidence_flags. */
+  const MissingEvidenceBadges: React.FC<{ flags: string[] | undefined }> = ({ flags }) => {
+    if (!flags || flags.length === 0) return null;
+    return (
+      <div
+        style={{
+          marginTop: '0.625rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.3rem',
+        }}
+        aria-label="RAG data gaps — information not yet verified from official sources"
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.25rem',
+            fontSize: '0.6875rem',
+            fontWeight: 700,
+            color: '#92400e',
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+          }}
+        >
+          <AlertTriangle size={11} aria-hidden="true" style={{ color: '#d97706', flexShrink: 0 }} />
+          <span>
+            {isHi
+              ? 'अनुपलब्ध / असत्यापित डेटा:'
+              : isMr
+              ? 'पडताळणी न झालेली माहिती:'
+              : 'Unverified Data Gaps:'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3125rem' }}>
+          {flags.map((flag, fIdx) => (
+            <span
+              key={fIdx}
+              style={{
+                display: 'inline-block',
+                fontSize: '0.6875rem',
+                lineHeight: 1.4,
+                backgroundColor: '#fffbeb',
+                color: '#92400e',
+                border: '1px solid #fde68a',
+                borderRadius: '4px',
+                padding: '2px 7px',
+                fontWeight: 500,
+              }}
+              title={flag}
+            >
+              {flag}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   if (!course) {
     return (
@@ -85,6 +151,66 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
         <Button variant="outline" size="sm" icon={<BookOpen size={15} />} onClick={onExploreCourses}>
           {isHi ? 'कोर्स चुनें (Browse Courses)' : isMr ? 'कोर्स निवडा (Browse Courses)' : 'Select a Course from Explorer'}
         </Button>
+
+        {/* ── RAG Consensus Recommendations (no course pinned) ── */}
+        {consensusRecommendations && consensusRecommendations.length > 0 && (
+          <div
+            style={{
+              borderTop: '1px solid var(--color-border-subtle)',
+              paddingTop: '0.875rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.75rem',
+            }}
+          >
+            <div
+              style={{
+                fontSize: '0.75rem',
+                fontWeight: 700,
+                color: 'var(--color-text-muted)',
+                textTransform: 'uppercase',
+                letterSpacing: '0.04em',
+              }}
+            >
+              {isHi ? 'RAG मार्ग सुझाव' : isMr ? 'RAG मार्ग शिफारशी' : 'RAG Pathway Recommendations'}
+            </div>
+            {consensusRecommendations.map((rec, idx) => (
+              <div
+                key={rec.course_id || idx}
+                style={{
+                  backgroundColor: 'var(--color-bg)',
+                  border: '1px solid var(--color-border-subtle)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: '0.625rem 0.75rem',
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: '0.8125rem',
+                    fontWeight: 700,
+                    color: 'var(--color-text-primary)',
+                    marginBottom: '0.25rem',
+                  }}
+                >
+                  {rec.course_title}
+                </div>
+                {rec.student_rationale && (
+                  <p
+                    style={{
+                      margin: '0 0 0.2rem 0',
+                      fontSize: '0.78125rem',
+                      color: 'var(--color-text-secondary)',
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {rec.student_rationale}
+                  </p>
+                )}
+                <MissingEvidenceBadges flags={rec.missing_evidence_flags} />
+              </div>
+            ))}
+          </div>
+        )}
       </aside>
     );
   }
@@ -245,6 +371,133 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
         <Button variant="outline" size="sm" onClick={() => onViewCourseDetails(course.id)}>
           {isHi ? 'पूरा कोर्स विवरण खोलें' : isMr ? 'संपूर्ण कोर्स तपशील उघडा' : 'Open Full Course Page'}
         </Button>
+      )}
+
+      {/* ── RAG Consensus Pathway Recommendations ─────────────────────────
+          Rendered when consensusRecommendations are provided from the
+          POST /families/{id}/analyze RAG pipeline. Shows missing_evidence_flags
+          as amber badges beneath each recommendation's rationale to surface
+          data gaps identified during retrieval-augmented generation.
+      ─────────────────────────────────────────────────────────────────── */}
+      {consensusRecommendations && consensusRecommendations.length > 0 && (
+        <div
+          style={{
+            borderTop: '1px solid var(--color-border-subtle)',
+            paddingTop: '1rem',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '0.875rem',
+          }}
+        >
+          <div
+            style={{
+              fontSize: '0.75rem',
+              fontWeight: 700,
+              color: 'var(--color-text-muted)',
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.3rem',
+            }}
+          >
+            <Sparkles size={12} aria-hidden="true" style={{ color: 'var(--color-primary)' }} />
+            <span>
+              {isHi
+                ? 'RAG-आधारित पाठ्यक्रम सुझाव'
+                : isMr
+                ? 'RAG-आधारित मार्ग शिफारशी'
+                : 'RAG-Grounded Pathway Recommendations'}
+            </span>
+          </div>
+
+          {consensusRecommendations.map((rec, idx) => (
+            <div
+              key={rec.course_id || idx}
+              style={{
+                backgroundColor: 'var(--color-bg)',
+                border: '1px solid var(--color-border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '0.75rem 0.875rem',
+              }}
+            >
+              {/* Recommendation title + fit score */}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'space-between',
+                  gap: '0.5rem',
+                  marginBottom: '0.375rem',
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: '0.8125rem',
+                    fontWeight: 700,
+                    color: 'var(--color-text-primary)',
+                    lineHeight: 1.35,
+                    flex: 1,
+                  }}
+                >
+                  {rec.course_title}
+                </span>
+                {rec.fit_score !== undefined && (
+                  <span
+                    style={{
+                      fontSize: '0.6875rem',
+                      fontWeight: 700,
+                      color: 'var(--color-primary)',
+                      backgroundColor: 'var(--color-primary-subtle, #eff6ff)',
+                      border: '1px solid var(--color-primary-subtle, #bfdbfe)',
+                      borderRadius: '4px',
+                      padding: '1px 6px',
+                      whiteSpace: 'nowrap',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {rec.fit_score}/100
+                  </span>
+                )}
+              </div>
+
+              {/* Student rationale */}
+              {rec.student_rationale && (
+                <p
+                  style={{
+                    margin: '0 0 0.25rem 0',
+                    fontSize: '0.78125rem',
+                    color: 'var(--color-text-secondary)',
+                    lineHeight: 1.45,
+                  }}
+                >
+                  {rec.student_rationale}
+                </p>
+              )}
+
+              {/* Parent rationale */}
+              {rec.parent_rationale && (
+                <p
+                  style={{
+                    margin: '0 0 0.25rem 0',
+                    fontSize: '0.78125rem',
+                    color: 'var(--color-text-secondary)',
+                    lineHeight: 1.45,
+                    fontStyle: 'italic',
+                  }}
+                >
+                  {rec.parent_rationale}
+                </p>
+              )}
+
+              {/* ── RAG Data-Gap Flags ──────────────────────────────────
+                  Amber badge list mapping over missing_evidence_flags[].
+                  Renders nothing when the array is empty or undefined.
+              ──────────────────────────────────────────────────────── */}
+              <MissingEvidenceBadges flags={rec.missing_evidence_flags} />
+            </div>
+          ))}
+        </div>
       )}
     </aside>
   );
