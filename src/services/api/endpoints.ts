@@ -32,5 +32,6 @@ export const ENDPOINTS = {
     ANALYZE: (familyId: string) => `/families/${familyId}/analyze`,
     SUMMARY: (familyId: string) => `/families/${familyId}/summary`,
     CONFIDENCE: (familyId: string) => `/families/${familyId}/confidence`,
+    DELETE: (familyId: string) => `/families/${familyId}`,
   },
 } as const;

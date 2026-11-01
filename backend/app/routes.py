@@ -456,6 +456,35 @@ def submit_post_confidence(family_id: str, payload: ConfidenceSubmission, db: Se
         recorded_at=family.confidence_submitted_at
     )
 
+# --- 7c. Delete Family Session (Development / Admin Only) ---
+@router.delete("/families/{family_id}", status_code=status.HTTP_200_OK)
+def delete_family(family_id: str, db: Session = Depends(get_db)):
+    """
+    Delete a family session and its dependent records (development/admin only).
+    Does NOT modify the course catalog, embeddings, RAG index, or other families.
+    """
+    family = db.query(FamilySessionModel).filter(FamilySessionModel.id == family_id).first()
+    if not family:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Family session '{family_id}' not found."
+        )
+
+    # 1. Delete dependent counsellor escalations first (foreign records)
+    db.query(CounsellorEscalationModel).filter(
+        CounsellorEscalationModel.family_id == family_id
+    ).delete(synchronize_session=False)
+
+    # 2. Delete requested family session
+    db.delete(family)
+    db.commit()
+
+    return {
+        "status": "deleted",
+        "family_id": family_id,
+        "message": f"Family session '{family_id}' and all associated records deleted successfully."
+    }
+
 # --- 8. Human Counsellor Escalation Hand-off ---
 @router.post("/counsellor/request", response_model=CounsellorRequestResponse, status_code=status.HTTP_201_CREATED)
 def submit_counsellor_request(payload: CounsellorRequestCreate, db: Session = Depends(get_db)):

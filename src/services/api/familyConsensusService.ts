@@ -161,6 +161,28 @@ class FamilyConsensusService {
   }
 
   /**
+   * Delete family session and its associated records (dev/admin)
+   */
+  async deleteFamily(familyId: string): Promise<boolean> {
+    try {
+      const isLive = await this.checkHealth();
+      if (isLive) {
+        await apiClient.delete(ENDPOINTS.FAMILIES.DELETE(familyId));
+      }
+      if (typeof window !== 'undefined' && window.sessionStorage) {
+        const active = window.sessionStorage.getItem('skillsaathi_active_family_id');
+        if (active === familyId) {
+          window.sessionStorage.removeItem('skillsaathi_active_family_id');
+        }
+      }
+      return true;
+    } catch (err) {
+      console.warn('[SkillSaathi] Failed to delete family session:', err);
+      return false;
+    }
+  }
+
+  /**
    * Transform assessment answers into student and parent intake payloads,
    * run the family consensus engine via FastAPI, and return the structured report.
    */
@@ -176,13 +198,33 @@ class FamilyConsensusService {
           ? window.sessionStorage.getItem('skillsaathi_active_family_id')
           : null;
 
+        // Context from onboarding & participant
+        const onboarding = this.getStoredOnboarding();
+        const participant = (answers.q_participant as string) || onboarding?.role || 'together';
+        const district = onboarding?.district || 'Pune';
+        const state = onboarding?.state || 'Maharashtra';
+
+        let familyName = 'Joint Family Intake';
+        let studentName = 'Student';
+        let parentName = 'Parent / Guardian';
+
+        if (participant === 'myself') {
+          studentName = 'Self Learner';
+          familyName = 'Student Direct Intake';
+        } else if (participant === 'child_student') {
+          studentName = 'Student';
+          familyName = 'Parent Guided Intake';
+        } else if (participant === 'together') {
+          familyName = 'Joint Family Intake';
+        }
+
         // 1. Create family session if not already existing
         if (!familyId) {
           const family = await apiClient.post<{ id: string }>(ENDPOINTS.FAMILIES.CREATE, {
-            family_name: 'Joint Family Intake',
+            family_name: familyName,
             language,
-            district: 'Pune',
-            state: 'Maharashtra',
+            district,
+            state,
           });
           familyId = family.id;
           if (typeof window !== 'undefined' && window.sessionStorage) {
@@ -191,35 +233,73 @@ class FamilyConsensusService {
         }
 
         // 2. Map student profile
-        const activities = Array.isArray(answers.q_activities) ? (answers.q_activities as string[]) : [];
-        const interestStreams = this.mapActivitiesToStreams(activities);
+        const rawActivities = Array.isArray(answers.q_activities) ? (answers.q_activities as string[]) : [];
+        const activities = rawActivities.filter((a) => a !== 'not_sure_yet');
+        let interestStreams = this.mapActivitiesToStreams(activities);
+        if (interestStreams.length === 0 && onboarding?.careerInterests?.length) {
+          interestStreams = onboarding.careerInterests;
+        }
+        if (interestStreams.length === 0) {
+          interestStreams = ['renewable_energy', 'automotive'];
+        }
+
+        const educationStr = answers.q_education as string | undefined;
+        const normalizedEdu = this.normalizeEducation(educationStr);
+        const derivedAge = this.deriveAgeFromEducation(educationStr);
+        const preferredDuration = this.derivePreferredDuration(answers);
+        const preConfidenceStudent = this.derivePreConfidenceScore(answers, false);
+
+        // Build rich student constraints map
+        const studentConstraints: Record<string, any> = {};
+        if (answers.q_strengths) studentConstraints.strengths = answers.q_strengths;
+        if (answers.q_environment) studentConstraints.preferred_environments = answers.q_environment;
+        if (answers.q_learning_style) studentConstraints.learning_style = answers.q_learning_style;
+        if (answers.q_priorities) studentConstraints.career_priorities = answers.q_priorities;
+        if (answers.q_followup_employment) studentConstraints.employment_evidence_preference = answers.q_followup_employment;
+        if (answers.q_followup_further_study) studentConstraints.further_study_goal = answers.q_followup_further_study;
+        if (answers.q_followup_other) studentConstraints.other_priority_notes = answers.q_followup_other;
+        if (answers.q_additional_notes) studentConstraints.additional_notes = answers.q_additional_notes;
+        if (participant) studentConstraints.participant_perspective = participant;
 
         await apiClient.post(ENDPOINTS.FAMILIES.STUDENT(familyId), {
-          student_name: 'Learner',
-          age: 17,
-          education_level: this.normalizeEducation(answers.q_education as string),
-          career_interests: interestStreams.length > 0 ? interestStreams : ['renewable_energy', 'automotive'],
+          student_name: studentName,
+          age: derivedAge,
+          education_level: normalizedEdu,
+          career_interests: interestStreams,
           hands_on_activities: activities,
-          preferred_duration_months: 6,
-          preferred_location: 'Pune',
-          pre_confidence_score: typeof answers.q_confidence === 'number' ? answers.q_confidence : 6.0,
+          preferred_duration_months: preferredDuration,
+          preferred_location: district,
+          constraints: studentConstraints,
+          pre_confidence_score: preConfidenceStudent,
         });
 
         // 3. Map parent profile
-        const concern = (answers.q_primary_concern as string) || 'job_security';
-        const concernsList = [concern];
-        if (answers.q_progression === 'degree_pathway') {
-          concernsList.push('degree_progression');
+        const parentConcerns = this.deriveParentConcerns(answers);
+        const parentBudget = this.deriveParentBudget(answers);
+        const degreeImportant = this.deriveDegreeImportance(answers);
+        const preConfidenceParent = this.derivePreConfidenceScore(answers, true);
+
+        // Parent preferred streams: align with student interests or high-demand technical trades
+        let parentStreams: string[] = [];
+        if (participant === 'together') {
+          parentStreams = interestStreams.slice(0, 2);
+        } else {
+          const highDemandPool = ['manufacturing_engineering', 'renewable_energy', 'it_tech', 'automotive'];
+          parentStreams = interestStreams.filter((s) => highDemandPool.includes(s));
+          if (parentStreams.length === 0) {
+            parentStreams = ['manufacturing_engineering', 'renewable_energy'];
+          }
         }
 
         await apiClient.post(ENDPOINTS.FAMILIES.PARENT(familyId), {
-          parent_name: 'Guardian / Parent',
-          primary_concerns: concernsList,
-          max_total_fees_inr: 20000,
-          preferred_streams: ['manufacturing_engineering', 'renewable_energy'],
-          location_preference: 'Pune',
-          degree_continuation_important: answers.q_progression !== 'fast_job',
-          pre_confidence_score: 5.5,
+          parent_name: parentName,
+          primary_concerns: parentConcerns,
+          max_total_fees_inr: parentBudget.maxTotalFeesInr,
+          max_monthly_budget_inr: parentBudget.maxMonthlyBudgetInr,
+          preferred_streams: parentStreams,
+          location_preference: district,
+          degree_continuation_important: degreeImportant,
+          pre_confidence_score: preConfidenceParent,
         });
 
         // 4. Run consensus analysis
@@ -241,38 +321,197 @@ class FamilyConsensusService {
     };
   }
 
+  private getStoredOnboarding(): {
+    role?: string;
+    educationLevel?: string;
+    state?: string;
+    district?: string;
+    careerInterests?: string[];
+  } | null {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      try {
+        const raw = window.sessionStorage.getItem('skillsaathi_demo_onboarding_prefs_v1');
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
   private normalizeEducation(eduStr?: string): string {
     if (!eduStr) return '10th_pass';
-    if (eduStr.includes('8')) return '8th_pass';
-    if (eduStr.includes('12')) return '12th_pass';
-    if (eduStr.includes('iti') || eduStr.includes('diploma')) return 'diploma';
-    if (eduStr.includes('grad')) return 'graduate';
+    const val = eduStr.toLowerCase();
+    if (val === 'class_8_10' || val.includes('8')) return '8th_pass';
+    if (val === 'completed_12' || val.includes('12')) return '12th_pass';
+    if (val === 'iti_vocational' || val.includes('iti') || val.includes('diploma') || val === 'diploma') return 'diploma';
+    if (val === 'graduate' || val.includes('grad')) return 'graduate';
     return '10th_pass';
   }
 
+  private deriveAgeFromEducation(eduStr?: string): number {
+    switch (eduStr) {
+      case 'class_8_10':
+        return 15;
+      case 'completed_10':
+        return 16;
+      case 'studying_11_12':
+        return 17;
+      case 'completed_12':
+        return 18;
+      case 'iti_vocational':
+        return 19;
+      case 'diploma':
+        return 20;
+      case 'graduate':
+        return 22;
+      default:
+        return 17;
+    }
+  }
+
   private mapActivitiesToStreams(activities: string[]): string[] {
-    const streams: string[] = [];
-    if (activities.includes('electricity_energy') || activities.includes('building_fixing')) {
-      streams.push('renewable_energy', 'automotive');
+    const streams = new Set<string>();
+    if (activities.includes('electricity_energy')) {
+      streams.add('renewable_energy');
     }
-    if (activities.includes('computers_tech') || activities.includes('design_creativity')) {
-      streams.push('it_tech');
-    }
-    if (activities.includes('helping_people')) {
-      streams.push('healthcare');
+    if (activities.includes('building_fixing')) {
+      streams.add('automotive');
+      streams.add('manufacturing_engineering');
     }
     if (activities.includes('precision_making')) {
-      streams.push('manufacturing_engineering');
+      streams.add('manufacturing_engineering');
+    }
+    if (activities.includes('computers_tech')) {
+      streams.add('it_tech');
+    }
+    if (activities.includes('design_creativity')) {
+      streams.add('it_tech');
+      streams.add('creative_media');
+    }
+    if (activities.includes('helping_people')) {
+      streams.add('healthcare');
+      streams.add('hospitality_tourism');
     }
     if (activities.includes('nature_outdoors')) {
-      streams.push('agriculture_allied');
+      streams.add('agriculture_allied');
     }
-    return streams;
+    if (activities.includes('communication_org')) {
+      streams.add('hospitality_tourism');
+    }
+    return Array.from(streams);
+  }
+
+  private deriveParentConcerns(answers: AssessmentAnswers): string[] {
+    const concerns = new Set<string>();
+    const priorities = Array.isArray(answers.q_priorities) ? (answers.q_priorities as string[]) : [];
+
+    if (priorities.includes('stable_employment') || priorities.includes('earning_potential')) {
+      concerns.add('job_security');
+    }
+    if (priorities.includes('affordable_training') || answers.q_followup_affordable) {
+      concerns.add('fees_cost');
+    }
+    if (priorities.includes('work_soon')) {
+      concerns.add('time_to_earn');
+    }
+    if (priorities.includes('near_home')) {
+      concerns.add('relocation');
+    }
+    if (priorities.includes('study_further') || answers.q_followup_further_study) {
+      concerns.add('degree_progression');
+    }
+
+    const empFollowup = answers.q_followup_employment as string | undefined;
+    if (empFollowup === 'placement_records' || empFollowup === 'company_mous') {
+      concerns.add('job_security');
+      concerns.add('social_respect');
+    } else if (empFollowup === 'naps_stipend') {
+      concerns.add('job_security');
+      concerns.add('time_to_earn');
+    }
+
+    if (concerns.size === 0) {
+      concerns.add('job_security');
+    }
+    return Array.from(concerns);
+  }
+
+  private deriveParentBudget(answers: AssessmentAnswers): { maxTotalFeesInr?: number; maxMonthlyBudgetInr?: number } {
+    const affordableFollowup = answers.q_followup_affordable as string | undefined;
+    const priorities = Array.isArray(answers.q_priorities) ? (answers.q_priorities as string[]) : [];
+
+    if (affordableFollowup === 'budget_under_15k') {
+      return { maxTotalFeesInr: 15000, maxMonthlyBudgetInr: 2500 };
+    }
+    if (affordableFollowup === 'subsidy_scholarship') {
+      return { maxTotalFeesInr: 10000, maxMonthlyBudgetInr: 2000 };
+    }
+    if (affordableFollowup === 'installment_options') {
+      return { maxTotalFeesInr: 20000, maxMonthlyBudgetInr: 3000 };
+    }
+    if (affordableFollowup === 'flexible_if_placed') {
+      return { maxTotalFeesInr: 35000, maxMonthlyBudgetInr: 5000 };
+    }
+    if (priorities.includes('affordable_training')) {
+      return { maxTotalFeesInr: 15000, maxMonthlyBudgetInr: 2500 };
+    }
+    return { maxTotalFeesInr: 25000, maxMonthlyBudgetInr: 4000 };
+  }
+
+  private derivePreferredDuration(answers: AssessmentAnswers): number {
+    const priorities = Array.isArray(answers.q_priorities) ? (answers.q_priorities as string[]) : [];
+    if (priorities.includes('work_soon')) {
+      return 6;
+    }
+    const studyFollowup = answers.q_followup_further_study as string | undefined;
+    if (studyFollowup === 'polytechnic_diploma' || studyFollowup === 'bvoc_degree') {
+      return 12;
+    }
+    if (answers.q_learning_style === 'practical_hands_on') {
+      return 6;
+    }
+    return 6;
+  }
+
+  private deriveDegreeImportance(answers: AssessmentAnswers): boolean {
+    const priorities = Array.isArray(answers.q_priorities) ? (answers.q_priorities as string[]) : [];
+    const studyFollowup = answers.q_followup_further_study as string | undefined;
+
+    if (studyFollowup === 'flexible_later') {
+      return false;
+    }
+    if (priorities.includes('study_further') || studyFollowup === 'polytechnic_diploma' || studyFollowup === 'bvoc_degree') {
+      return true;
+    }
+    if (priorities.includes('work_soon') && !priorities.includes('study_further')) {
+      return false;
+    }
+    return true;
+  }
+
+  private derivePreConfidenceScore(answers: AssessmentAnswers, isParent = false): number {
+    if (typeof answers.q_confidence === 'number') {
+      return answers.q_confidence;
+    }
+    const strengths = Array.isArray(answers.q_strengths) ? (answers.q_strengths as string[]) : [];
+    const activities = Array.isArray(answers.q_activities) ? (answers.q_activities as string[]) : [];
+
+    if (activities.includes('not_sure_yet') || strengths.includes('discovering_strengths')) {
+      return isParent ? 5.0 : 5.0;
+    }
+    if (strengths.length >= 3 && !strengths.includes('discovering_strengths')) {
+      return isParent ? 6.5 : 7.0;
+    }
+    return isParent ? 5.5 : 6.0;
   }
 
   private generateLocalFallback(answers: AssessmentAnswers): ConsensusSummaryData {
     const activities = Array.isArray(answers.q_activities) ? (answers.q_activities as string[]) : [];
     const streams = this.mapActivitiesToStreams(activities);
+    const parentBudget = this.deriveParentBudget(answers);
+    const preStudent = this.derivePreConfidenceScore(answers, false);
+    const preParent = this.derivePreConfidenceScore(answers, true);
 
     return {
       family_id: 'local-demo-session',
@@ -286,7 +525,7 @@ class FamilyConsensusService {
       ],
       parent_priorities: [
         'Recognized government certification (NCVET/DGT/NSDC)',
-        'Budget cap: manageable tuition under ₹20,000 with financial aid',
+        `Budget cap: manageable tuition under ₹${parentBudget.maxTotalFeesInr?.toLocaleString() || '20,000'} with financial aid`,
         'Preserved lateral entry option to degree (B.Voc / Diploma)',
       ],
       shared_strengths: [
@@ -405,8 +644,8 @@ class FamilyConsensusService {
         '2. Confirm fee subsidies and apprenticeship stipends to ensure zero household financial strain.',
         '3. Plan a joint weekend visit to the local Government ITI to inspect workshop equipment.',
       ],
-      pre_confidence_student: typeof answers.q_confidence === 'number' ? answers.q_confidence : 6.0,
-      pre_confidence_parent: 5.5,
+      pre_confidence_student: preStudent,
+      pre_confidence_parent: preParent,
       post_confidence_student: undefined,
       post_confidence_parent: undefined,
       confidence_delta: undefined,

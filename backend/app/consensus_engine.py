@@ -178,6 +178,19 @@ class FamilyConsensusEngine:
         loc = student.get("preferred_location")
         if loc:
             priorities.append(f"Preferred Training Location: {loc}.")
+        constraints = student.get("constraints") or {}
+        if constraints.get("learning_style"):
+            ls = constraints["learning_style"]
+            if ls == "practical_hands_on":
+                priorities.append("Learning Style: Prefers practical workshop learning and hands-on lab training.")
+            elif ls == "mix_practical_classroom":
+                priorities.append("Learning Style: Balanced mix of classroom theory and practical workshop practice.")
+            elif ls == "classroom_theory":
+                priorities.append("Learning Style: Structured conceptual learning and theoretical fundamentals.")
+        if constraints.get("strengths"):
+            st_list = [str(s).replace("_", " ").title() for s in constraints["strengths"] if s != "discovering_strengths"]
+            if st_list:
+                priorities.append(f"Practical Strengths: {', '.join(st_list[:3])}.")
         if not priorities:
             priorities.append("Seeking industry-aligned vocational skills with fast track to employment.")
         return priorities
@@ -196,6 +209,12 @@ class FamilyConsensusEngine:
         max_fees = parent.get("max_total_fees_inr")
         if max_fees is not None and max_fees > 0:
             priorities.append(f"Budget Limit: Total training expenditure capped at ₹{max_fees:,}.")
+        monthly_budget = parent.get("max_monthly_budget_inr")
+        if monthly_budget is not None and monthly_budget > 0:
+            priorities.append(f"Monthly Budget: Target installment capacity around ₹{monthly_budget:,}/month.")
+        loc_pref = parent.get("location_preference")
+        if loc_pref:
+            priorities.append(f"Location Preference: Regional centers around {loc_pref}.")
         if parent.get("degree_continuation_important"):
             priorities.append("Requires clear pathway for lateral entry to degree (B.Voc / Polytechnic diploma).")
         if not priorities:

@@ -266,9 +266,17 @@ def build_rag_query(
         if isinstance(activities, list):
             for act in activities:
                 tokens.append(ACTIVITY_KEYWORDS.get(act, act.replace("_", " ")))
+        priorities = assessment_answers.get("q_priorities") or []
+        if isinstance(priorities, list):
+            for pri in priorities:
+                pri_str = str(pri)
+                tokens.append(CONCERN_KEYWORDS.get(pri_str, pri_str.replace("_", " ")))
         concerns = assessment_answers.get("q_primary_concern")
         if concerns:
             tokens.append(CONCERN_KEYWORDS.get(str(concerns), str(concerns).replace("_", " ")))
+        edu = assessment_answers.get("q_education")
+        if edu:
+            tokens.append(f"requires {str(edu).replace('_', ' ')} education")
 
     if not tokens:
         tokens = ["vocational training government certified practical employment"]

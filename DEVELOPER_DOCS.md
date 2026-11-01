@@ -204,6 +204,7 @@ User answers questions (AssessmentScreen)
 | `POST` | `/families/{id}/analyze` | Run consensus engine → `ConsensusSummaryData` |
 | `GET` | `/families/{id}/summary` | Fetch existing consensus summary |
 | `POST` | `/families/{id}/confidence` | Submit post-counselling confidence score |
+| `DELETE` | `/families/{id}` | Delete family session and dependent records (dev/admin only) |
 | `GET` | `/counselling/sessions` | List counselling sessions |
 | `GET` | `/counselling/sessions/{id}` | Session detail |
 | `GET` | `/counselling/sessions/{id}/messages` | Session messages |
