@@ -92,14 +92,46 @@ export interface ConsensusSummaryData {
   confidence_delta?: number;
   confidence_status?: 'opt_in_pending' | 'actual_delta_recorded';
   counselling_mode?: 'deterministic' | 'ai_grounded';
+  counselling_model?: string;
   counselling_mode_note?: string;
   disclaimer: string;
   is_demo_data: boolean;
 }
 
+export const AVAILABLE_GEMINI_MODELS = [
+  {
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
+    tag: 'Recommended (Deep RAG Reasoning)',
+    description: 'High-capability reasoning model for grounded evidence synthesis and dialogue planning.',
+  },
+  {
+    id: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash',
+    tag: 'Balanced',
+    description: 'Fast, balanced generative model for career analysis.',
+  },
+  {
+    id: 'gemini-3.5-flash-lite',
+    name: 'Gemini 3.5 Flash Lite',
+    tag: 'Low-Latency',
+    description: 'Lightweight, ultra-fast model with minimal latency.',
+  },
+  {
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash Lite',
+    tag: 'Fast Inference',
+    description: 'Cost-efficient flash lite model for streamlined extraction.',
+  },
+] as const;
+
+export type GeminiModelId = typeof AVAILABLE_GEMINI_MODELS[number]['id'];
+
 export interface FamilyConsensusResult {
   mode: 'live' | 'demo';
-  summary: ConsensusSummaryData;
+  summary?: ConsensusSummaryData;
+  error?: string;
+  selectedModel?: string;
 }
 
 class FamilyConsensusService {
@@ -166,7 +198,9 @@ class FamilyConsensusService {
    */
   async runFamilyConsensus(
     answers: AssessmentAnswers,
-    language = 'en'
+    language = 'en',
+    model = 'gemini-3.8-flash',
+    strict = true
   ): Promise<FamilyConsensusResult> {
     const isLive = await this.checkHealth();
 
@@ -222,22 +256,43 @@ class FamilyConsensusService {
           pre_confidence_score: 5.5,
         });
 
-        // 4. Run consensus analysis
-        const analysis = await apiClient.post<ConsensusSummaryData>(ENDPOINTS.FAMILIES.ANALYZE(familyId));
+        // 4. Run consensus analysis with chosen Gemini model & strict mode
+        const endpoint = `${ENDPOINTS.FAMILIES.ANALYZE(familyId)}?model=${encodeURIComponent(model)}&strict=${strict ? 'true' : 'false'}`;
+        const analysis = await apiClient.post<ConsensusSummaryData>(endpoint);
 
         return {
           mode: 'live',
           summary: analysis,
+          selectedModel: model,
         };
-      } catch (err) {
-        console.warn('[SkillSaathi] Live backend consensus failed, falling back to local demo:', err);
+      } catch (err: any) {
+        console.warn('[SkillSaathi] Live backend consensus failed:', err);
+        const errorDetail =
+          err?.details?.detail ||
+          err?.message ||
+          `Gemini RAG Generation Failed (${model}). Please verify GEMINI_API_KEY and model availability.`;
+
+        if (strict) {
+          return {
+            mode: 'live',
+            error: errorDetail,
+            selectedModel: model,
+          };
+        }
       }
+    } else if (strict) {
+      return {
+        mode: 'live',
+        error: 'FastAPI Backend is offline or unreachable at /api/health. Please ensure the backend server is running (.venv/bin/python backend/run.py) to execute RAG.',
+        selectedModel: model,
+      };
     }
 
-    // Fallback demonstration evaluation
+    // Fallback demonstration evaluation (only when strict is disabled)
     return {
       mode: 'demo',
       summary: this.generateLocalFallback(answers),
+      selectedModel: model,
     };
   }
 

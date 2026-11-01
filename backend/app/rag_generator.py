@@ -153,11 +153,18 @@ def _build_generation_prompt(
 # Gemini call
 # ---------------------------------------------------------------------------
 
-def _call_gemini_generate(prompt: str) -> Optional[str]:
+def _call_gemini_generate(prompt: str, model_name: str = "gemini-3.8-flash") -> tuple[Optional[str], Optional[str]]:
+    """
+    Calls Gemini API for text generation.
+    Returns (raw_response_text, None) on success, or (None, error_description) on failure.
+    """
+    if not settings.GEMINI_API_KEY or not settings.GEMINI_API_KEY.strip():
+        return None, "GEMINI_API_KEY is missing or empty in backend/.env"
+
     api_key = settings.GEMINI_API_KEY.strip()
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-3.8-flash:generateContent?key={api_key}"
+        f"{model_name}:generateContent?key={api_key}"
     )
 
     payload = {
@@ -185,15 +192,28 @@ def _call_gemini_generate(prompt: str) -> Optional[str]:
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts:
-                        return parts[0].get("text", "")
+                        return parts[0].get("text", ""), None
+                return None, "Gemini returned candidates without content parts."
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            err_json = json.loads(err_body)
+            msg = err_json.get("error", {}).get("message", err_body)
+        except Exception:
+            msg = err_body
+        logger.warning("[RAG-Gen] Gemini HTTP %s error (%s): %s", exc.code, model_name, msg)
+        return None, f"Gemini HTTP {exc.code}: {msg}"
     except urllib.error.URLError as exc:
         logger.warning("[RAG-Gen] Gemini connection error: %s", exc)
+        return None, f"Connection failed: {str(exc.reason)}"
     except TimeoutError:
         logger.warning("[RAG-Gen] Gemini timed out after %.1fs", settings.LLM_TIMEOUT_SECONDS)
+        return None, f"Gemini timed out after {settings.LLM_TIMEOUT_SECONDS}s"
     except Exception as exc:
         logger.warning("[RAG-Gen] Unexpected error calling Gemini: %s", exc)
+        return None, f"Unexpected error: {str(exc)}"
 
-    return None
+    return None, "No response from Gemini API"
 
 
 # ---------------------------------------------------------------------------
@@ -229,22 +249,23 @@ def _parse_and_merge(
     raw_text: str,
     base_analysis: Dict[str, Any],
     retrieved_courses: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    model_name: str = "gemini-3.8-flash",
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         parsed = json.loads(_clean_json_text(raw_text))
     except json.JSONDecodeError as exc:
         logger.warning("[RAG-Gen] JSON parse failed: %s", exc)
-        return None
+        return None, f"Failed to parse JSON response: {str(exc)}"
 
     if not isinstance(parsed, dict):
         logger.warning("[RAG-Gen] Unexpected response type: %s", type(parsed))
-        return None
+        return None, "Model response was not a JSON dictionary"
 
     # Validate required keys present
     missing_keys = _REQUIRED_KEYS - set(parsed.keys())
     if missing_keys:
         logger.warning("[RAG-Gen] Missing keys in LLM response: %s", missing_keys)
-        return None
+        return None, f"Model response missing keys: {', '.join(missing_keys)}"
 
     # Validate readiness value
     readiness = parsed.get("overall_consensus_readiness", "moderate")
@@ -277,7 +298,7 @@ def _parse_and_merge(
 
     if not valid_recs:
         logger.warning("[RAG-Gen] No valid recommendations in LLM response.")
-        return None
+        return None, "No valid course recommendations generated."
 
     parsed["top_pathway_recommendations"] = valid_recs[:3]
 
@@ -293,14 +314,15 @@ def _parse_and_merge(
         "top_pathway_recommendations": valid_recs[:3],
         "discussion_guide": parsed.get("discussion_guide") or base_analysis.get("discussion_guide", []),
         "counselling_mode": "ai_grounded",
+        "counselling_model": model_name,
         "counselling_mode_note": (
             parsed.get("ai_counselling_note")
-            or "Synthesized by Gemini 3.8 Flash using RAG-retrieved NCVET/DGT course evidence."
+            or f"Synthesized by {model_name} using RAG-retrieved NCVET/DGT course evidence."
         ),
         "is_demo_data": False,
     })
 
-    return enhanced
+    return enhanced, None
 
 
 # ---------------------------------------------------------------------------
@@ -313,29 +335,31 @@ def generate_rag_consensus(
     parent: Dict[str, Any],
     retrieved_courses: List[Dict[str, Any]],
     base_analysis: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    model_name: str = "gemini-3.8-flash",
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Use Gemini to generate a ConsensusSummaryData dict grounded in the
-    RAG-retrieved courses. Returns None if GEMINI_API_KEY is missing or
-    any step fails (signals to caller to use deterministic fallback).
+    RAG-retrieved courses. Returns (result_dict, error_string).
     """
     if not settings.GEMINI_API_KEY or not settings.GEMINI_API_KEY.strip():
-        return None
+        return None, "GEMINI_API_KEY is not configured in backend/.env"
 
     if not retrieved_courses:
         logger.warning("[RAG-Gen] No retrieved courses; skipping generation.")
-        return None
+        return None, "No relevant courses retrieved from vector store."
 
     try:
         prompt = _build_generation_prompt(student, parent, retrieved_courses, base_analysis)
-        raw = _call_gemini_generate(prompt)
-        if not raw:
-            return None
-        result = _parse_and_merge(raw, base_analysis, retrieved_courses)
+        raw, err = _call_gemini_generate(prompt, model_name=model_name)
+        if err or not raw:
+            return None, err or "Empty response from Gemini."
+        result, parse_err = _parse_and_merge(raw, base_analysis, retrieved_courses, model_name=model_name)
+        if parse_err:
+            return None, parse_err
         if result:
-            logger.info("[RAG-Gen] AI-grounded consensus generated for family %s", family_id)
-        return result
+            logger.info("[RAG-Gen] AI-grounded consensus generated with %s for family %s", model_name, family_id)
+        return result, None
     except Exception as exc:
         logger.warning("[RAG-Gen] Unexpected error during RAG generation: %s", exc)
-        return None
+        return None, f"Unexpected error during RAG generation: {str(exc)}"
 

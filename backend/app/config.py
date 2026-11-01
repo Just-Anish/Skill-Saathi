@@ -1,5 +1,12 @@
 import os
+from pathlib import Path
 from typing import List
+from dotenv import load_dotenv
+
+# Load .env from backend/ or project root
+_backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(_backend_dir / ".env")
+load_dotenv(_backend_dir.parent / ".env")
 
 class Settings:
     APP_NAME: str = "SkillSaathi Family Consensus API"

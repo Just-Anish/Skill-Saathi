@@ -2,6 +2,7 @@ import pytest
 from backend.tests.conftest import client
 from backend.app.consensus_engine import FamilyConsensusEngine
 from backend.app.ai_counsellor import AICounsellorAdapter
+from backend.app.config import settings
 
 # 1. Aligned Priorities Test
 def test_aligned_priorities_consensus():
@@ -126,8 +127,9 @@ def test_incomplete_family_handling():
     assert "Missing" in analyze_resp.json()["detail"]
 
 # 4. AI Provider Safe Fallback & Evidence-Aware Response Policy
-def test_ai_provider_fallback_mode():
+def test_ai_provider_fallback_mode(monkeypatch):
     # When GEMINI_API_KEY is not set or adapter returns None
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "")
     assert AICounsellorAdapter.is_configured() is False
     res = AICounsellorAdapter.enhance_analysis(
         base_analysis={"dummy": 123},

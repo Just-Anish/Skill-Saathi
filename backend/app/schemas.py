@@ -180,6 +180,7 @@ class ConsensusSummaryResponse(BaseModel):
     confidence_delta: Optional[float] = None
     confidence_status: str = "opt_in_pending"  # opt_in_pending, actual_delta_recorded
     counselling_mode: str = "deterministic"  # deterministic, ai_grounded
+    counselling_model: Optional[str] = None
     counselling_mode_note: str = "Evaluated using SkillSaathi Evidence-Grounded Consensus Engine."
     disclaimer: str
     is_demo_data: bool = True

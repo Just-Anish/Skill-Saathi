@@ -25,8 +25,8 @@ export class ApiClient {
   private baseUrl: string;
 
   constructor(baseUrl?: string) {
-    // Read from environment variable or default to empty string for relative paths
-    this.baseUrl = baseUrl ?? (import.meta.env.VITE_API_BASE_URL || '');
+    // Default to /api which proxies to FastAPI backend (http://127.0.0.1:8000)
+    this.baseUrl = baseUrl ?? (import.meta.env.VITE_API_BASE_URL || '/api');
   }
 
   private buildUrl(

@@ -231,7 +231,12 @@ def list_courses(
 # --- 6. Run Family Consensus Analysis (RAG-enhanced) ---
 @router.post("/families/{family_id}/analyze", response_model=ConsensusSummaryResponse, status_code=status.HTTP_200_OK)
 @router.post("/families/{family_id}/analysis", response_model=ConsensusSummaryResponse, status_code=status.HTTP_200_OK)
-def analyze_family_consensus(family_id: str, db: Session = Depends(get_db)):
+def analyze_family_consensus(
+    family_id: str,
+    model: str = Query("gemini-3.8-flash", description="Gemini model for RAG synthesis"),
+    strict: bool = Query(False, description="If True, returns 502/error on Gemini failure instead of falling back"),
+    db: Session = Depends(get_db)
+):
     family = db.query(FamilySessionModel).filter(FamilySessionModel.id == family_id).first()
     if not family:
         raise HTTPException(
@@ -310,13 +315,19 @@ def analyze_family_consensus(family_id: str, db: Session = Depends(get_db)):
     # ------------------------------------------------------------------ #
     # Step 3: RAG Generation — Gemini enhances with retrieved context    #
     # ------------------------------------------------------------------ #
-    rag_enhanced = generate_rag_consensus(
+    rag_enhanced, rag_error = generate_rag_consensus(
         family_id=family_id,
         student=student,
         parent=parent,
         retrieved_courses=retrieved_courses,
         base_analysis=analysis,
+        model_name=model,
     )
+    if strict and rag_error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini RAG Generation Failed using [{model}]: {rag_error}",
+        )
     if rag_enhanced:
         analysis = rag_enhanced
 

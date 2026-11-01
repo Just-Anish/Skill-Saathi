@@ -27,13 +27,15 @@ import { AssessmentLanguage, AssessmentResultsData, LocalizedString, AssessmentA
 import { Button } from '../../components/common/Button';
 import { Badge } from '../../components/common/Badge';
 import { CounsellorRequestForm } from './CounsellorRequestForm';
-import { familyConsensusService, FamilyConsensusResult } from '../../services/api/familyConsensusService';
+import { familyConsensusService, FamilyConsensusResult, AVAILABLE_GEMINI_MODELS } from '../../services/api/familyConsensusService';
 
 export interface AssessmentResultsProps {
   results: AssessmentResultsData;
   language: AssessmentLanguage;
   answers?: AssessmentAnswers;
   familyId?: string;
+  initialModel?: string;
+  initialStrict?: boolean;
   onExploreCourses: () => void;
   onViewCourseDetails: (courseId: string) => void;
   onChangeAnswers: () => void;
@@ -52,6 +54,8 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
   language,
   answers,
   familyId,
+  initialModel,
+  initialStrict,
   onExploreCourses,
   onViewCourseDetails,
   onChangeAnswers,
@@ -63,6 +67,22 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
   const [showRestartConfirm, setShowRestartConfirm] = useState<boolean>(false);
   const [consensusResult, setConsensusResult] = useState<FamilyConsensusResult | null>(null);
   const [isLoadingConsensus, setIsLoadingConsensus] = useState<boolean>(false);
+  const [showFallbackAnyway, setShowFallbackAnyway] = useState<boolean>(false);
+
+  const [selectedModel, setSelectedModel] = useState<string>(
+    initialModel ||
+    (typeof window !== 'undefined' && window.sessionStorage
+      ? window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-3.8-flash'
+      : 'gemini-3.8-flash')
+  );
+
+  const [strictRAG, setStrictRAG] = useState<boolean>(
+    initialStrict !== undefined
+      ? initialStrict
+      : typeof window !== 'undefined' && window.sessionStorage
+      ? window.sessionStorage.getItem('skillsaathi_strict_rag') !== 'false'
+      : true
+  );
 
   // Actual Post-Guidance Self-Reported Confidence Tracking (Opt-In)
   const [postConfidenceScore, setPostConfidenceScore] = useState<number>(8);
@@ -137,6 +157,31 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
     }
   };
 
+  const executeConsensus = async (modelToUse = selectedModel, strictToUse = strictRAG) => {
+    setIsLoadingConsensus(true);
+    setShowFallbackAnyway(false);
+    try {
+      const res = await familyConsensusService.runFamilyConsensus(
+        answers || {},
+        language,
+        modelToUse,
+        strictToUse
+      );
+      setConsensusResult(res);
+      if (res.summary?.family_id && typeof window !== 'undefined' && window.sessionStorage) {
+        window.sessionStorage.setItem('skillsaathi_active_family_id', res.summary.family_id);
+      }
+    } catch (err: any) {
+      setConsensusResult({
+        mode: 'live',
+        error: err?.message || 'Failed to communicate with RAG consensus service.',
+        selectedModel: modelToUse,
+      });
+    } finally {
+      setIsLoadingConsensus(false);
+    }
+  };
+
   useEffect(() => {
     let isMounted = true;
     setIsLoadingConsensus(true);
@@ -153,18 +198,26 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
         try {
           const stored = await familyConsensusService.getFamilySummary(activeFamilyId);
           if (stored && stored.summary && isMounted) {
-            setConsensusResult(stored);
-            setIsLoadingConsensus(false);
-            return;
+            // If already AI-grounded or not strict, use stored summary
+            if (stored.summary.counselling_mode === 'ai_grounded' || !strictRAG) {
+              setConsensusResult(stored);
+              setIsLoadingConsensus(false);
+              return;
+            }
           }
         } catch {
           // Proceed to run fresh consensus
         }
       }
 
-      // 2. Run consensus engine
+      // 2. Run fresh consensus with selectedModel and strict mode
       try {
-        const res = await familyConsensusService.runFamilyConsensus(answers || {}, language);
+        const res = await familyConsensusService.runFamilyConsensus(
+          answers || {},
+          language,
+          selectedModel,
+          strictRAG
+        );
         if (isMounted) {
           setConsensusResult(res);
           setIsLoadingConsensus(false);
@@ -172,8 +225,13 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
             window.sessionStorage.setItem('skillsaathi_active_family_id', res.summary.family_id);
           }
         }
-      } catch {
+      } catch (err: any) {
         if (isMounted) {
+          setConsensusResult({
+            mode: 'live',
+            error: err?.message || 'Failed to communicate with RAG consensus service.',
+            selectedModel,
+          });
           setIsLoadingConsensus(false);
         }
       }
@@ -184,22 +242,10 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [answers, language, familyId]);
+  }, [answers, language, familyId, selectedModel, strictRAG]);
 
   const handleRefreshConsensus = () => {
-    setIsLoadingConsensus(true);
-    familyConsensusService
-      .runFamilyConsensus(answers || {}, language)
-      .then((res) => {
-        setConsensusResult(res);
-        setIsLoadingConsensus(false);
-        if (res.summary?.family_id && typeof window !== 'undefined' && window.sessionStorage) {
-          window.sessionStorage.setItem('skillsaathi_active_family_id', res.summary.family_id);
-        }
-      })
-      .catch(() => {
-        setIsLoadingConsensus(false);
-      });
+    executeConsensus(selectedModel, strictRAG);
   };
 
   const recommendations = results.recommendations || [];
@@ -717,14 +763,70 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', flexWrap: 'wrap' }}>
-            {consensusResult?.mode === 'live' ? (
+            {/* Gemini Model Selector */}
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-text-secondary)' }}>RAG Model:</span>
+              <select
+                value={selectedModel}
+                onChange={(e) => {
+                  const newModel = e.target.value;
+                  setSelectedModel(newModel);
+                  if (typeof window !== 'undefined' && window.sessionStorage) {
+                    window.sessionStorage.setItem('skillsaathi_rag_model', newModel);
+                  }
+                  executeConsensus(newModel, strictRAG);
+                }}
+                disabled={isLoadingConsensus}
+                style={{
+                  fontSize: '0.8125rem',
+                  padding: '0.35rem 0.6rem',
+                  borderRadius: '6px',
+                  border: '1px solid var(--color-border)',
+                  backgroundColor: 'var(--color-surface)',
+                  color: 'var(--color-text-primary)',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                {AVAILABLE_GEMINI_MODELS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Strict RAG Checkbox */}
+            <label
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px',
+                fontSize: '0.75rem',
+                color: 'var(--color-text-secondary)',
+                cursor: 'pointer',
+                userSelect: 'none',
+              }}
+              title="When enabled, displays actual errors if Gemini RAG fails instead of silently using deterministic scoring"
+            >
+              <input
+                type="checkbox"
+                checked={strictRAG}
+                onChange={(e) => {
+                  const val = e.target.checked;
+                  setStrictRAG(val);
+                  if (typeof window !== 'undefined' && window.sessionStorage) {
+                    window.sessionStorage.setItem('skillsaathi_strict_rag', val ? 'true' : 'false');
+                  }
+                }}
+              />
+              <span>Strict RAG Mode</span>
+            </label>
+
+            {consensusResult?.mode === 'live' && !consensusResult.error && (
               <Badge variant="success" size="sm">
                 <CheckCircle2 size={13} style={{ marginRight: '4px' }} />
                 <span>Live FastAPI Backend</span>
-              </Badge>
-            ) : (
-              <Badge variant="neutral" size="sm">
-                <span>Demo Consensus Mode</span>
               </Badge>
             )}
 
@@ -736,13 +838,13 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
               style={{ padding: '0.35rem 0.75rem', fontSize: '0.8125rem' }}
             >
               <RefreshCw size={13} style={{ marginRight: '5px' }} className={isLoadingConsensus ? 'animate-spin' : ''} />
-              {isLoadingConsensus ? 'Analyzing...' : 'Refresh Consensus'}
+              {isLoadingConsensus ? 'Synthesizing...' : 'Re-run RAG'}
             </Button>
           </div>
         </div>
 
         {/* Loading State for Consensus Analysis */}
-        {isLoadingConsensus && !consensusResult && (
+        {isLoadingConsensus && (
           <div
             style={{
               padding: '2.5rem 1.5rem',
@@ -755,58 +857,146 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', color: 'var(--color-primary)', fontWeight: 600 }}>
               <RefreshCw size={18} className="animate-spin" />
               <span>
-                {isHi
-                  ? 'पारिवारिक सहमति का विश्लेषण किया जा रहा है...'
-                  : isMr
-                  ? 'कौटुंबिक सहमतीचे विश्लेषण सुरू आहे...'
-                  : 'Analyzing Family Consensus & Multi-Criteria Trade-offs...'}
+                Synthesizing RAG Consensus with {AVAILABLE_GEMINI_MODELS.find(m => m.id === selectedModel)?.name || selectedModel}...
               </span>
             </div>
             <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted, #64748b)', margin: '8px 0 0 0' }}>
-              {isHi
-                ? 'फास्टएपीआई बैकएंड छात्र और माता-पिता के प्रोफाइलों की तुलना कर रहा है।'
-                : isMr
-                ? 'फास्टएपीआय बॅकएंड विद्यार्थी आणि पालकांच्या प्रोफाइलची तुलना करत आहे.'
-                : 'FastAPI backend engine is evaluating compatibility, detecting disagreements, and mapping career pathways.'}
+              Retrieving dense course embeddings, reconciling family priorities, and querying Google Gemini API.
             </p>
           </div>
         )}
 
-        {/* Offline / Backend Unavailable Banner */}
-        {!isLoadingConsensus && !consensusResult && (
+        {/* RAG Execution Error Banner (Strict Mode) */}
+        {!isLoadingConsensus && consensusResult?.error && !showFallbackAnyway && (
           <div
             style={{
-              padding: '1.25rem 1.5rem',
-              backgroundColor: '#fffbeb',
+              padding: '1.5rem',
+              backgroundColor: '#fef2f2',
               borderRadius: '12px',
-              border: '1px solid #fde68a',
+              border: '1.5px solid #f87171',
               display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
+              flexDirection: 'column',
               gap: '1rem',
-              flexWrap: 'wrap',
             }}
           >
-            <div>
-              <strong style={{ color: '#92400e', fontSize: '0.9375rem' }}>
-                {isHi ? 'बैकएंड सेवा अनुपलब्ध है' : isMr ? 'बॅकएंड सेवा अनुपलब्ध आहे' : 'FastAPI Backend Service Offline'}
-              </strong>
-              <p style={{ color: '#b45309', fontSize: '0.8125rem', margin: '4px 0 0 0' }}>
-                {isHi
-                  ? 'स्थानीय फास्टएपीआई बैकएंड (http://127.0.0.1:8000) से कनेक्ट नहीं हो सका। कृपया सर्वर पुनः जांचें।'
-                  : isMr
-                  ? 'स्थानिक फास्टएपीआय बॅकएंडशी (http://127.0.0.1:8000) संपर्क होऊ शकला नाही. कृपया सर्व्हर तपासा.'
-                  : 'Unable to reach local FastAPI backend server at http://127.0.0.1:8000. Start backend server or retry.'}
-              </p>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem' }}>
+              <div
+                style={{
+                  width: '38px',
+                  height: '38px',
+                  borderRadius: '50%',
+                  backgroundColor: '#fee2e2',
+                  color: '#dc2626',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <AlertTriangle size={22} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <strong style={{ color: '#991b1b', fontSize: '1.0625rem' }}>
+                    Gemini RAG Generation Failed
+                  </strong>
+                  <Badge variant="warning" size="sm">
+                    Model: {consensusResult.selectedModel || selectedModel}
+                  </Badge>
+                  <Badge variant="neutral" size="sm">
+                    Strict RAG Active
+                  </Badge>
+                </div>
+                <p style={{ color: '#b91c1c', fontSize: '0.875rem', margin: '6px 0 0 0', lineHeight: 1.5 }}>
+                  Because <strong>Strict RAG Mode</strong> is enabled, execution paused so you can inspect the exact error rather than silently defaulting to deterministic scoring.
+                </p>
+                <div
+                  style={{
+                    marginTop: '0.75rem',
+                    padding: '0.875rem 1rem',
+                    backgroundColor: '#ffffff',
+                    border: '1px solid #fca5a5',
+                    borderRadius: '8px',
+                    fontFamily: 'monospace',
+                    fontSize: '0.8125rem',
+                    color: '#991b1b',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {consensusResult.error}
+                </div>
+              </div>
             </div>
-            <Button variant="primary" size="sm" onClick={handleRefreshConsensus}>
-              {isHi ? 'पुनः प्रयास करें' : isMr ? 'पुन्हा प्रयत्न करा' : 'Retry'}
-            </Button>
+
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '0.75rem',
+                borderTop: '1px solid #fecaca',
+                paddingTop: '0.875rem',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => {
+                    const newModel = e.target.value;
+                    setSelectedModel(newModel);
+                    if (typeof window !== 'undefined' && window.sessionStorage) {
+                      window.sessionStorage.setItem('skillsaathi_rag_model', newModel);
+                    }
+                  }}
+                  style={{
+                    fontSize: '0.8125rem',
+                    padding: '0.45rem 0.75rem',
+                    borderRadius: '6px',
+                    border: '1px solid #f87171',
+                    backgroundColor: '#ffffff',
+                    fontWeight: 600,
+                  }}
+                >
+                  {AVAILABLE_GEMINI_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      Try {m.name}
+                    </option>
+                  ))}
+                </select>
+
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => executeConsensus(selectedModel, true)}
+                  disabled={isLoadingConsensus}
+                >
+                  <RefreshCw size={14} style={{ marginRight: '6px' }} className={isLoadingConsensus ? 'animate-spin' : ''} />
+                  Retry with {AVAILABLE_GEMINI_MODELS.find(m => m.id === selectedModel)?.name}
+                </Button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowFallbackAnyway(true)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: '#6b7280',
+                  fontSize: '0.8125rem',
+                  textDecoration: 'underline',
+                  cursor: 'pointer',
+                  padding: '4px 8px',
+                }}
+              >
+                View Deterministic Consensus Fallback Anyway →
+              </button>
+            </div>
           </div>
         )}
 
         {/* Readiness Status Banner */}
-        {consensusResult?.summary && (
+        {consensusResult?.summary && (!consensusResult.error || showFallbackAnyway) && (
           <div
             style={{
               padding: '1rem 1.25rem',
@@ -849,7 +1039,7 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
                   )}
                   <Badge variant={consensusResult.summary.counselling_mode === 'ai_grounded' ? 'primary' : 'neutral'} size="sm">
                     {consensusResult.summary.counselling_mode === 'ai_grounded'
-                      ? 'Grounded AI (Gemini)'
+                      ? `Grounded AI (${consensusResult.summary.counselling_model || selectedModel})`
                       : 'Deterministic Consensus Engine'}
                   </Badge>
                 </div>

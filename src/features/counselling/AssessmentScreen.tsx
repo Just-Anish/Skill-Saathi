@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowLeft, ArrowRight, CheckCircle2, AlertCircle } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CheckCircle2, AlertCircle, Cpu } from 'lucide-react';
 import {
   AssessmentAnswers,
   AnswerValue,
@@ -10,6 +10,8 @@ import { QuestionRenderer } from './QuestionRenderer';
 import { AssessmentResults } from './AssessmentResults';
 import { CareerGuidanceIntro } from './CareerGuidanceIntro';
 import { Button } from '../../components/common/Button';
+import { Badge } from '../../components/common/Badge';
+import { AVAILABLE_GEMINI_MODELS } from '../../services/api/familyConsensusService';
 import { ROUTES } from '../../app/routes';
 import { useTranslation, SupportedLanguageCode } from '../../i18n';
 
@@ -20,7 +22,7 @@ export interface AssessmentScreenProps {
   onViewCourseDetails?: (courseId: string) => void;
 }
 
-export type GuidanceViewMode = 'intro' | 'assessment' | 'results';
+export type GuidanceViewMode = 'intro' | 'assessment' | 'model_select' | 'results';
 
 export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
   courseId,
@@ -36,6 +38,20 @@ export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
   const [validationError, setValidationError] = useState<string | null>(null);
   const [showExitModal, setShowExitModal] = useState<boolean>(false);
   const [hasSavedSession, setHasSavedSession] = useState<boolean>(false);
+
+  const [selectedRAGModel, setSelectedRAGModel] = useState<string>(() => {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      return window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-3.8-flash';
+    }
+    return 'gemini-3.8-flash';
+  });
+
+  const [strictRAG, setStrictRAG] = useState<boolean>(() => {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      return window.sessionStorage.getItem('skillsaathi_strict_rag') !== 'false';
+    }
+    return true;
+  });
 
   // Restore saved session or pre-seed course context on initial mount
   useEffect(() => {
@@ -123,9 +139,9 @@ export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
       setActiveQuestionIndex(safeIndex + 1);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } else {
-      // Completed all applicable questions -> move directly to Results and mark completed
+      // Completed all applicable questions -> move to RAG Model Selection step
       assessmentService.saveSession(answers, totalQuestions, true);
-      setViewMode('results');
+      setViewMode('model_select');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
@@ -208,7 +224,193 @@ export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
     );
   }
 
-  // 2. RESULTS VIEW
+  // 2. RAG MODEL SELECTION VIEW (Between last question and results)
+  if (viewMode === 'model_select') {
+    return (
+      <div
+        className="model-selection-screen"
+        style={{
+          width: '100%',
+          maxWidth: '760px',
+          margin: '0 auto',
+          padding: '1.5rem 1rem 4rem 1rem',
+        }}
+      >
+        <div
+          style={{
+            backgroundColor: 'var(--color-surface)',
+            border: '1.5px solid var(--color-primary-subtle, #bfdbfe)',
+            borderRadius: '16px',
+            padding: '2rem',
+            boxShadow: 'var(--shadow-md)',
+          }}
+        >
+          {/* Header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+            <div
+              style={{
+                width: '42px',
+                height: '42px',
+                borderRadius: '12px',
+                backgroundColor: 'rgba(13, 148, 136, 0.1)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'var(--color-primary)',
+              }}
+            >
+              <Cpu size={24} />
+            </div>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <h1 style={{ fontSize: '1.375rem', fontWeight: 800, margin: 0, color: 'var(--color-text-primary)' }}>
+                  Select Gemini Model for RAG Synthesis
+                </h1>
+                <Badge variant="primary" size="sm">
+                  RAG Pipeline
+                </Badge>
+              </div>
+              <p style={{ margin: '4px 0 0 0', fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
+                Your assessment answers are saved. Choose the Google Gemini model you want to query for Retrieval-Augmented Generation (RAG).
+              </p>
+            </div>
+          </div>
+
+          {/* Model Options Grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '0.875rem', margin: '1.5rem 0' }}>
+            {AVAILABLE_GEMINI_MODELS.map((m) => {
+              const isSelected = selectedRAGModel === m.id;
+              return (
+                <div
+                  key={m.id}
+                  onClick={() => {
+                    setSelectedRAGModel(m.id);
+                    if (typeof window !== 'undefined' && window.sessionStorage) {
+                      window.sessionStorage.setItem('skillsaathi_rag_model', m.id);
+                    }
+                  }}
+                  style={{
+                    padding: '1rem 1.25rem',
+                    borderRadius: '12px',
+                    border: isSelected
+                      ? '2px solid var(--color-primary)'
+                      : '1.5px solid var(--color-border)',
+                    backgroundColor: isSelected ? 'rgba(13, 148, 136, 0.04)' : 'var(--color-surface)',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease-in-out',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '1rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.875rem' }}>
+                    <input
+                      type="radio"
+                      name="gemini_rag_model"
+                      value={m.id}
+                      checked={isSelected}
+                      onChange={() => {
+                        setSelectedRAGModel(m.id);
+                        if (typeof window !== 'undefined' && window.sessionStorage) {
+                          window.sessionStorage.setItem('skillsaathi_rag_model', m.id);
+                        }
+                      }}
+                      style={{ cursor: 'pointer', accentColor: 'var(--color-primary)' }}
+                    />
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <strong style={{ fontSize: '0.9375rem', color: 'var(--color-text-primary)' }}>
+                          {m.name}
+                        </strong>
+                        <span
+                          style={{
+                            fontSize: '0.6875rem',
+                            fontWeight: 700,
+                            padding: '2px 6px',
+                            borderRadius: '4px',
+                            backgroundColor: isSelected ? 'var(--color-primary)' : 'var(--color-neutral-subtle, #f1f5f9)',
+                            color: isSelected ? '#ffffff' : 'var(--color-text-secondary)',
+                          }}
+                        >
+                          {m.tag}
+                        </span>
+                      </div>
+                      <p style={{ margin: '3px 0 0 0', fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>
+                        {m.description}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Strict RAG Checkbox */}
+          <div
+            style={{
+              padding: '0.875rem 1rem',
+              borderRadius: '8px',
+              backgroundColor: '#fffbeb',
+              border: '1px solid #fde68a',
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: '0.625rem',
+              marginBottom: '1.5rem',
+            }}
+          >
+            <input
+              type="checkbox"
+              id="strict_rag_toggle"
+              checked={strictRAG}
+              onChange={(e) => {
+                const val = e.target.checked;
+                setStrictRAG(val);
+                if (typeof window !== 'undefined' && window.sessionStorage) {
+                  window.sessionStorage.setItem('skillsaathi_strict_rag', val ? 'true' : 'false');
+                }
+              }}
+              style={{ marginTop: '3px', cursor: 'pointer', accentColor: '#d97706' }}
+            />
+            <label htmlFor="strict_rag_toggle" style={{ cursor: 'pointer', fontSize: '0.8125rem', color: '#92400e', lineHeight: 1.45 }}>
+              <strong>Strict RAG Mode (Recommended for RAG evaluation):</strong> If Gemini returns an error (e.g. invalid key, quota, or model issue), pause and display the exact error instead of silently proceeding on the deterministic engine.
+            </label>
+          </div>
+
+          {/* Action Navigation */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+            <Button
+              variant="outline"
+              size="md"
+              icon={<ArrowLeft size={16} />}
+              onClick={() => {
+                setActiveQuestionIndex(totalQuestions - 1);
+                setViewMode('assessment');
+              }}
+            >
+              Back to Questions
+            </Button>
+
+            <Button
+              variant="primary"
+              size="lg"
+              icon={<ArrowRight size={18} />}
+              iconPosition="right"
+              onClick={() => {
+                setViewMode('results');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              style={{ fontWeight: 700 }}
+            >
+              Launch RAG Family Consensus →
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. RESULTS VIEW
   if (viewMode === 'results') {
     const resultsData = assessmentService.generateResults(answers);
     return (
@@ -218,6 +420,8 @@ export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
           language={language}
           answers={answers}
           familyId={assessmentService.loadSession()?.familyId}
+          initialModel={selectedRAGModel}
+          initialStrict={strictRAG}
           onExploreCourses={() => onNavigate && onNavigate(ROUTES.COURSES)}
           onViewCourseDetails={(cId) => {
             if (onViewCourseDetails) onViewCourseDetails(cId);
