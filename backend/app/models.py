@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, Boolean, Text, DateTime, JSON
+from sqlalchemy import Column, String, Integer, Float, Boolean, Text, DateTime, JSON, ForeignKey
+from sqlalchemy.orm import relationship
 from .database import Base
 
 def utc_now():
@@ -26,6 +27,14 @@ class FamilySessionModel(Base):
     post_confidence_parent = Column(Float, nullable=True)
     confidence_feedback = Column(Text, nullable=True)
     confidence_submitted_at = Column(DateTime, nullable=True)
+
+    # Cascading dependent records
+    escalations = relationship(
+        "CounsellorEscalationModel",
+        back_populates="family_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 class CourseModel(Base):
     __tablename__ = "courses"
@@ -64,7 +73,7 @@ class CounsellorEscalationModel(Base):
     __tablename__ = "counsellor_escalations"
 
     id = Column(String(36), primary_key=True, index=True)
-    family_id = Column(String(36), nullable=True, index=True)
+    family_id = Column(String(36), ForeignKey("family_sessions.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at = Column(DateTime, default=utc_now)
     name = Column(String(100), nullable=False)
     phone = Column(String(20), nullable=False)
@@ -72,3 +81,5 @@ class CounsellorEscalationModel(Base):
     district = Column(String(100), nullable=True)
     topic = Column(String(100), default="course_choice")
     status = Column(String(50), default="pending")
+
+    family_session = relationship("FamilySessionModel", back_populates="escalations")

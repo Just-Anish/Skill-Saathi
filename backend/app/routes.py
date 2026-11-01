@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from .database import get_db
+from .config import settings
 from .models import FamilySessionModel, CourseModel, CounsellorEscalationModel
 from .schemas import (
     FamilyCreate,
@@ -461,8 +462,16 @@ def submit_post_confidence(family_id: str, payload: ConfidenceSubmission, db: Se
 def delete_family(family_id: str, db: Session = Depends(get_db)):
     """
     Delete a family session and its dependent records (development/admin only).
-    Does NOT modify the course catalog, embeddings, RAG index, or other families.
+    Safely cascades deletion to dependent records and wraps operation in a transaction.
+    Does NOT modify the course catalog, vector store, embeddings, or unrelated families.
     """
+    # Development-only safeguard: restrict deletion in production environments
+    if settings.APP_ENV == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Family deletion is restricted in production mode. Set APP_ENV=development to enable."
+        )
+
     family = db.query(FamilySessionModel).filter(FamilySessionModel.id == family_id).first()
     if not family:
         raise HTTPException(
@@ -470,20 +479,34 @@ def delete_family(family_id: str, db: Session = Depends(get_db)):
             detail=f"Family session '{family_id}' not found."
         )
 
-    # 1. Delete dependent counsellor escalations first (foreign records)
-    db.query(CounsellorEscalationModel).filter(
-        CounsellorEscalationModel.family_id == family_id
-    ).delete(synchronize_session=False)
+    try:
+        # 1. Delete dependent counsellor escalations first (foreign records)
+        escalations_deleted = (
+            db.query(CounsellorEscalationModel)
+            .filter(CounsellorEscalationModel.family_id == family_id)
+            .delete(synchronize_session=False)
+        )
 
-    # 2. Delete requested family session
-    db.delete(family)
-    db.commit()
+        # 2. Delete requested family session
+        db.delete(family)
 
-    return {
-        "status": "deleted",
-        "family_id": family_id,
-        "message": f"Family session '{family_id}' and all associated records deleted successfully."
-    }
+        # 3. Commit transaction atomically
+        db.commit()
+
+        return {
+            "status": "deleted",
+            "family_id": family_id,
+            "escalations_deleted": escalations_deleted,
+            "message": f"Family session '{family_id}' and all associated records deleted successfully."
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error while deleting family session '{family_id}': {str(exc)}"
+        )
 
 # --- 8. Human Counsellor Escalation Hand-off ---
 @router.post("/counsellor/request", response_model=CounsellorRequestResponse, status_code=status.HTTP_201_CREATED)

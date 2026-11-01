@@ -31,6 +31,7 @@ STRICT GROUNDING RULES:
 4. Maintain a neutral, culturally sensitive, respectful tone appropriate for semi-urban/rural Indian families.
 5. The report must bridge student aspirations and parent concerns — acknowledge both perspectives.
 6. Return STRICTLY valid JSON matching the schema described. No markdown fences, no extra keys.
+7. `unresolved_concerns` and `discussion_guide` MUST be flat arrays of plain strings — never arrays of objects or dicts.
 
 OUTPUT JSON SCHEMA (return exactly this structure):
 {
@@ -49,7 +50,8 @@ OUTPUT JSON SCHEMA (return exactly this structure):
       "resolution_pathway": "<str>"
     }
   ],
-  "unresolved_concerns": ["<str>", ...],
+  "unresolved_concerns": ["<plain string — NOT an object>", ...],
+  IMPORTANT: `unresolved_concerns` and `discussion_guide` MUST be flat arrays of plain strings. Never use dicts or objects for these fields.
   "top_pathway_recommendations": [
     {
       "course_id": "<str>",
@@ -72,7 +74,7 @@ OUTPUT JSON SCHEMA (return exactly this structure):
       "is_demo": true
     }
   ],
-  "discussion_guide": ["<str>", ...],
+  "discussion_guide": ["<plain string — NOT an object>", ...],
   "ai_counselling_note": "<str>"
 }
 """
@@ -155,15 +157,12 @@ def _build_generation_prompt(
 
 def _call_gemini_generate(prompt: str) -> Optional[str]:
     api_key = settings.GEMINI_API_KEY.strip()
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-3.8-flash:generateContent?key={api_key}"
-    )
+    model = "models/gemini-3.8-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={api_key}"
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.25,
             "responseMimeType": "application/json",
             "maxOutputTokens": 4096,
         },
@@ -177,7 +176,7 @@ def _call_gemini_generate(prompt: str) -> Optional[str]:
     )
 
     try:
-        timeout = max(settings.LLM_TIMEOUT_SECONDS, 30.0)  # RAG generation needs more time
+        timeout = max(settings.LLM_TIMEOUT_SECONDS, 60.0)  # RAG generation needs more time
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -212,6 +211,40 @@ _REQUIRED_KEYS = {
 }
 
 _VALID_READINESS = {"high", "moderate", "requires_dialogue"}
+
+
+def _coerce_to_str_list(value: Any, field_name: str) -> List[str]:
+    """
+    Ensure a field the LLM was supposed to return as List[str] actually is one.
+    Handles three cases the model commonly produces instead of plain strings:
+      - Already a list of str  -> returned as-is
+      - List of dicts          -> extract first string value found in each dict
+      - Single str             -> wrapped in a list
+    """
+    if not isinstance(value, list):
+        return [str(value)] if value else []
+    result: List[str] = []
+    for item in value:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Prefer well-known keys, then fall back to the first string value
+            for key in ("concern", "topic", "step", "guide", "text", "description", "detail"):
+                if key in item and isinstance(item[key], str):
+                    result.append(item[key])
+                    break
+            else:
+                # Grab the first string-valued entry
+                for v in item.values():
+                    if isinstance(v, str):
+                        result.append(v)
+                        break
+                else:
+                    result.append(str(item))
+            logger.debug("[RAG-Gen] Coerced dict to str in field '%s': %s", field_name, item)
+        else:
+            result.append(str(item))
+    return result
 
 
 def _clean_json_text(raw: str) -> str:
@@ -289,9 +322,15 @@ def _parse_and_merge(
         "parent_priorities": parsed.get("parent_priorities") or base_analysis.get("parent_priorities", []),
         "shared_strengths": parsed.get("shared_strengths") or base_analysis.get("shared_strengths", []),
         "identified_disagreements": parsed.get("identified_disagreements") or base_analysis.get("identified_disagreements", []),
-        "unresolved_concerns": parsed.get("unresolved_concerns") or base_analysis.get("unresolved_concerns", []),
+        "unresolved_concerns": _coerce_to_str_list(
+            parsed.get("unresolved_concerns") or base_analysis.get("unresolved_concerns", []),
+            "unresolved_concerns",
+        ),
         "top_pathway_recommendations": valid_recs[:3],
-        "discussion_guide": parsed.get("discussion_guide") or base_analysis.get("discussion_guide", []),
+        "discussion_guide": _coerce_to_str_list(
+            parsed.get("discussion_guide") or base_analysis.get("discussion_guide", []),
+            "discussion_guide",
+        ),
         "counselling_mode": "ai_grounded",
         "counselling_mode_note": (
             parsed.get("ai_counselling_note")

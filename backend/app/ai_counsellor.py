@@ -100,7 +100,8 @@ class AICounsellorAdapter:
     @classmethod
     def _call_provider(cls, prompt: str) -> Optional[str]:
         api_key = settings.GEMINI_API_KEY.strip()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
+        model = "models/gemini-3.8-flash"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={api_key}"
 
         payload = {
             "contents": [
@@ -109,7 +110,6 @@ class AICounsellorAdapter:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.2,
                 "responseMimeType": "application/json"
             }
         }
@@ -122,7 +122,7 @@ class AICounsellorAdapter:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=settings.LLM_TIMEOUT_SECONDS) as resp:
+            with urllib.request.urlopen(req, timeout=max(settings.LLM_TIMEOUT_SECONDS, 60.0)) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     candidates = data.get("candidates", [])

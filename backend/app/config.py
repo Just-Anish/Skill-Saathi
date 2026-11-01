@@ -20,6 +20,6 @@ class Settings:
     # AI Provider configuration (Grounded LLM integration)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
-    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "5.0"))
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "60.0"))
 
 settings = Settings()

@@ -28,14 +28,12 @@ def _embed_via_gemini(texts: List[str]) -> Optional[List[List[float]]]:
         return None
 
     api_key = settings.GEMINI_API_KEY.strip()
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-embedding-2:batchEmbedContents?key={api_key}"
-    )
+    model = "models/gemini-embedding-2"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents?key={api_key}"
 
     requests_payload = [
         {
-            "model": "models/gemini-embedding-2",
+            "model": model,
             "content": {"parts": [{"text": t}]},
             "taskType": "RETRIEVAL_DOCUMENT",
         }
@@ -56,6 +54,9 @@ def _embed_via_gemini(texts: List[str]) -> Optional[List[List[float]]]:
                 embeddings = [e["values"] for e in data.get("embeddings", [])]
                 if len(embeddings) == len(texts):
                     return embeddings
+    except urllib.error.HTTPError as exc:
+        err_msg = exc.read().decode("utf-8", errors="replace")[:300]
+        logger.warning("[RAG] Gemini batchEmbed HTTP %d: %s", exc.code, err_msg)
     except Exception as exc:
         logger.warning("[RAG] Gemini embedding call failed: %s", exc)
     return None
@@ -67,12 +68,10 @@ def _embed_query_gemini(text: str) -> Optional[List[float]]:
         return None
 
     api_key = settings.GEMINI_API_KEY.strip()
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-embedding-2:embedContent?key={api_key}"
-    )
+    model = "models/gemini-embedding-2"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:embedContent?key={api_key}"
     payload = {
-        "model": "models/gemini-embedding-2",
+        "model": model,
         "content": {"parts": [{"text": text}]},
         "taskType": "RETRIEVAL_QUERY",
     }
@@ -88,6 +87,9 @@ def _embed_query_gemini(text: str) -> Optional[List[float]]:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
                 return data.get("embedding", {}).get("values")
+    except urllib.error.HTTPError as exc:
+        err_msg = exc.read().decode("utf-8", errors="replace")[:300]
+        logger.warning("[RAG] Gemini embedContent HTTP %d: %s", exc.code, err_msg)
     except Exception as exc:
         logger.warning("[RAG] Gemini query embed failed: %s", exc)
     return None

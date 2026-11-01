@@ -12,7 +12,7 @@
 - **Backend:** FastAPI (Python) expected at `http://localhost:8000/api/v1`. Frontend has **resilient fallback** to local mock data when backend is offline
 - **Storage:** Browser `sessionStorage` (ephemeral session data) + `localStorage` (language preference only)
 - **i18n:** Custom React Context provider. Supports `en`, `mr` (Marathi), `hi` (Hindi). Key stored in `localStorage` under `skillsaathi_language`
-- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and **`gemini-3.8-flash`** for grounded consensus report synthesis and AI counselling note generation. When `GEMINI_API_KEY` is not provided, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. Frontend features resilient fallback.
+- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and **`gemini-3.8-flash`** for grounded consensus report synthesis and AI counselling note generation. Deprecated sampling parameters (`temperature`, `top_p`, `top_k`) are omitted from generation configs in compliance with current API requirements. **LLM call timeout:** `LLM_TIMEOUT_SECONDS` defaults to `60.0 s`; both `rag_generator.py` and `ai_counsellor.py` enforce a minimum floor of `60.0 s` via `max(settings.LLM_TIMEOUT_SECONDS, 60.0)` to prevent premature fallback to deterministic mode. When `GEMINI_API_KEY` is not provided, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. Frontend features resilient fallback.
 
 ```
 Browser
@@ -214,6 +214,30 @@ User answers questions (AssessmentScreen)
 | `GET` | `/analytics/streams` | Stream distribution analytics |
 | `GET` | `/analytics/consensus` | Consensus analytics |
 
+#### Family Deletion Endpoint Specification
+
+- **Endpoint:** `DELETE /api/v1/families/{family_id}`
+- **Request:** Path parameter `family_id` (UUID string). No request body required.
+- **Response (200 OK):**
+  ```json
+  {
+    "status": "deleted",
+    "family_id": "9b09d105-d906-4068-8e7d-b3b2552ca64f",
+    "escalations_deleted": 0,
+    "message": "Family session '9b09d105-d906-4068-8e7d-b3b2552ca64f' and all associated records deleted successfully."
+  }
+  ```
+- **Error Responses:**
+  - `404 Not Found`: Returned if `family_id` does not exist in `family_sessions`.
+  - `403 Forbidden`: Returned in production environments (`APP_ENV=production`) as a safety measure.
+  - `500 Internal Server Error`: Returned if database transaction fails; triggers automatic `db.rollback()`.
+- **Cascading Behavior:**
+  1. Identifies and deletes dependent foreign-key records first (`counsellor_escalations` where `family_id == family_id`).
+  2. Deletes the target `family_sessions` record.
+  3. Commits the transaction atomically.
+  4. Isolation guarantee: leaves course catalog (`courses`), vector store embeddings, RAG in-memory index, and all other families completely untouched.
+- **Security & Authorization:** Restricted to development and administrative environments via `settings.APP_ENV != "production"`. No unauthenticated deletion is permitted in production deployments.
+
 ---
 
 ## Data Models
@@ -381,13 +405,13 @@ type SupportedLanguage = 'en' | 'hi' | 'mr' | 'ta' | 'te' | 'bn' | 'gu' | 'kn' |
 
 ### RAG Models & Vector Store Configuration
 
-The RAG pipeline utilizes the following Google Gemini models:
+The RAG pipeline utilizes the following Google Gemini models (with deprecated sampling parameters `temperature`, `top_p`, and `top_k` explicitly omitted):
 
 | Component | Model Identifier | API Endpoint / Method | Role & Description | Fallback Mechanism |
 |---|---|---|---|---|
 | **Course & Query Embeddings** | `gemini-embedding-2` | `models/gemini-embedding-2:batchEmbedContents`<br>`models/gemini-embedding-2:embedContent` | Ingestion & query vectorization (`taskType: RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`). Embeds course titles, descriptions, NSQF levels, eligibility, and curriculum highlights. | Pure-Python in-memory TF-IDF vectorizer + cosine similarity ranking (`_use_vectors=False`). |
-| **Consensus Report Synthesis** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze`). Produces structured JSON consensus summary, alignment scores, and unresolved concerns. | Deterministic `FamilyConsensusEngine.analyze_family()` rule engine. |
-| **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. | Returns base deterministic analysis unchanged. |
+| **Consensus Report Synthesis** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze`). Produces structured JSON consensus summary, alignment scores, and unresolved concerns. Sampling parameters (`temperature`, `top_p`, `top_k`) are omitted; relies on `responseMimeType: "application/json"`. | Deterministic `FamilyConsensusEngine.analyze_family()` rule engine. |
+| **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. Deprecated sampling parameters omitted. | Returns base deterministic analysis unchanged. |
 
 ### UI Data Gap Surfacing
 
@@ -398,3 +422,14 @@ The RAG pipeline utilizes the following Google Gemini models:
 - **Placement:** Rendered beneath `student_rationale` + `parent_rationale` for each pathway in both panel modes (active-course and empty-panel fallback)
 - **Null safety:** Guards on empty/undefined array — no render cost when flags are absent
 - **Prop threading:** Parent must pass `consensusRecommendations` from `ConsensusSummaryData.top_pathway_recommendations` (available in `AssessmentResults.tsx` after `runFamilyConsensus()` resolves)
+
+---
+
+## Implementation Progress
+
+| Task / Milestone | Scope | Status | Details |
+|---|---|---|---|
+| **Task 1: Core Architecture Documentation** | Full Stack | **COMPLETE** | Comprehensive architectural map, data models, runtime flows, and storage mechanisms documented in `DEVELOPER_DOCS.md`. |
+| **Task 2: Backend RAG Pipeline Implementation** | Backend | **COMPLETE** | Vector store, course ingestion, and grounded generation migrated to `gemini-embedding-2` and `gemini-3.8-flash` with deprecated sampling parameters (`temperature`, `top_p`, `top_k`) removed and resilient TF-IDF fallback retained. |
+| **Task 3: Family Deletion API & Evidence Gap UI Sync** | Backend + Frontend + Docs | **COMPLETE** | Implemented `DELETE /api/v1/families/{family_id}` with cascading foreign-key deletion and transaction rollback; surfaced RAG `missing_evidence_flags` in `EvidencePanel.tsx`. |
+
