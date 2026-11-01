@@ -12,7 +12,7 @@
 - **Backend:** FastAPI (Python) expected at `http://localhost:8000/api/v1`. Frontend has **resilient fallback** to local mock data when backend is offline
 - **Storage:** Browser `sessionStorage` (ephemeral session data) + `localStorage` (language preference only)
 - **i18n:** Custom React Context provider. Supports `en`, `mr` (Marathi), `hi` (Hindi). Key stored in `localStorage` under `skillsaathi_language`
-- **AI/LLM:** No LLM currently wired in the frontend. Backend note in [`familyConsensusService.ts`](src/services/api/familyConsensusService.ts) states: _"Real LLM mode activates when `GEMINI_API_KEY` is configured in backend environment."_ Frontend uses deterministic rule-based scoring
+- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and **`gemini-3.8-flash`** for grounded consensus report synthesis and AI counselling note generation. When `GEMINI_API_KEY` is not provided, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. Frontend features resilient fallback.
 
 ```
 Browser
@@ -103,7 +103,7 @@ npm run build
 - [`counsellingService.ts`](src/features/counselling/counsellingService.ts) — Keyword-matching response generator with 650ms simulated latency
 - [`counsellingContent.ts`](src/features/counselling/counsellingContent.ts) — Localized response templates, suggested questions, UI text
 - [`AssessmentResults.tsx`](src/features/counselling/AssessmentResults.tsx) — Results display; triggers `familyConsensusService.runFamilyConsensus()`
-- [`EvidencePanel.tsx`](src/features/counselling/EvidencePanel.tsx) — Displays consensus report: shared priorities, disagreements, recommendations
+- [`EvidencePanel.tsx`](src/features/counselling/EvidencePanel.tsx) — Chat sidebar that pins a single `Course` and renders the consensus report (shared priorities, disagreements, pathway recommendations). Accepts optional `consensusRecommendations?: ConsensusRecommendation[]` prop (imported from `familyConsensusService`); inner `MissingEvidenceBadges` component renders `missing_evidence_flags[]` as amber warning badges (`bg:#fffbeb`, `color:#92400e`, `border:#fde68a`) beneath each recommendation's student/parent rationale. Renders nothing when the flags array is empty or undefined. Badge section appears in both the active-course panel and the empty-panel fallback.
 
 #### Course Explorer (`src/features/courses/`)
 - [`CourseExplorer.tsx`](src/features/courses/CourseExplorer.tsx) — List view with filter sidebar; calls `courseService.filterCourses()`
@@ -375,5 +375,25 @@ type SupportedLanguage = 'en' | 'hi' | 'mr' | 'ta' | 'te' | 'bn' | 'gu' | 'kn' |
 - **Retrieval trigger:** Currently happens in `careerRecommendationService.matchCareerPaths()` — deterministic scoring over in-memory array. Replace with vector similarity search over embedded course catalog
 - **LLM handoff point:** `familyConsensusService.runFamilyConsensus()` — already structured as an async pipeline that POST's to backend. The backend `counselling_mode: 'ai_grounded'` flag signals when Gemini is connected
 - **Session context for RAG:** `AssessmentAnswers` (answers record) is the natural query context; `FamilyProfile` maps to structured metadata filters for retrieval
-- **Missing evidence flags:** `Course.missingEvidenceFlags[]` / `ConsensusRecommendation.missing_evidence_flags[]` — explicitly mark data gaps; use as negative signals or uncertainty annotations in RAG responses
+- **Missing evidence flags:** `Course.missingEvidenceFlags[]` / `ConsensusRecommendation.missing_evidence_flags[]` — explicitly mark data gaps; use as negative signals or uncertainty annotations in RAG responses. **Now visually surfaced in `EvidencePanel.tsx`** via the inner `MissingEvidenceBadges` component — renders each flag string as an amber-styled badge beneath each pathway's rationale text. Empty or undefined arrays render nothing (zero noise when all evidence is present).
 
+
+### RAG Models & Vector Store Configuration
+
+The RAG pipeline utilizes the following Google Gemini models:
+
+| Component | Model Identifier | API Endpoint / Method | Role & Description | Fallback Mechanism |
+|---|---|---|---|---|
+| **Course & Query Embeddings** | `gemini-embedding-2` | `models/gemini-embedding-2:batchEmbedContents`<br>`models/gemini-embedding-2:embedContent` | Ingestion & query vectorization (`taskType: RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`). Embeds course titles, descriptions, NSQF levels, eligibility, and curriculum highlights. | Pure-Python in-memory TF-IDF vectorizer + cosine similarity ranking (`_use_vectors=False`). |
+| **Consensus Report Synthesis** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze`). Produces structured JSON consensus summary, alignment scores, and unresolved concerns. | Deterministic `FamilyConsensusEngine.analyze_family()` rule engine. |
+| **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. | Returns base deterministic analysis unchanged. |
+
+### UI Data Gap Surfacing
+
+**Component:** `MissingEvidenceBadges` (inner component of `EvidencePanel.tsx`)
+
+- **Trigger:** `ConsensusRecommendation.missing_evidence_flags` array (non-empty)
+- **Visual style:** Inline badge row; each flag is a `<span>` with `bg:#fffbeb` / `color:#92400e` / `border:1px solid #fde68a` / `borderRadius:4px` / `fontSize:0.6875rem`; prefixed with `AlertTriangle` lucide icon
+- **Placement:** Rendered beneath `student_rationale` + `parent_rationale` for each pathway in both panel modes (active-course and empty-panel fallback)
+- **Null safety:** Guards on empty/undefined array — no render cost when flags are absent
+- **Prop threading:** Parent must pass `consensusRecommendations` from `ConsensusSummaryData.top_pathway_recommendations` (available in `AssessmentResults.tsx` after `runFamilyConsensus()` resolves)

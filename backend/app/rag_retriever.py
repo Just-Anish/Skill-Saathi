@@ -1,7 +1,7 @@
 """
 SkillSaathi RAG Retriever
 In-memory ChromaDB vector store for course catalog.
-Embeds courses at startup using Google's text-embedding-004 model (via Gemini API).
+Embeds courses at startup using Google's gemini-embedding-2 model (via Gemini API).
 Falls back to TF-IDF keyword retrieval when GEMINI_API_KEY is absent.
 """
 
@@ -23,19 +23,19 @@ logger = logging.getLogger("skillsaathi.rag")
 # ---------------------------------------------------------------------------
 
 def _embed_via_gemini(texts: List[str]) -> Optional[List[List[float]]]:
-    """Batch-embed texts using Gemini text-embedding-004. Returns None on failure."""
+    """Batch-embed texts using Gemini gemini-embedding-2. Returns None on failure."""
     if not settings.GEMINI_API_KEY:
         return None
 
     api_key = settings.GEMINI_API_KEY.strip()
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"text-embedding-004:batchEmbedContents?key={api_key}"
+        f"gemini-embedding-2:batchEmbedContents?key={api_key}"
     )
 
     requests_payload = [
         {
-            "model": "models/text-embedding-004",
+            "model": "models/gemini-embedding-2",
             "content": {"parts": [{"text": t}]},
             "taskType": "RETRIEVAL_DOCUMENT",
         }
@@ -69,10 +69,10 @@ def _embed_query_gemini(text: str) -> Optional[List[float]]:
     api_key = settings.GEMINI_API_KEY.strip()
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"text-embedding-004:embedContent?key={api_key}"
+        f"gemini-embedding-2:embedContent?key={api_key}"
     )
     payload = {
-        "model": "models/text-embedding-004",
+        "model": "models/gemini-embedding-2",
         "content": {"parts": [{"text": text}]},
         "taskType": "RETRIEVAL_QUERY",
     }

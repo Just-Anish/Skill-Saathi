@@ -157,7 +157,7 @@ def _call_gemini_generate(prompt: str) -> Optional[str]:
     api_key = settings.GEMINI_API_KEY.strip()
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={api_key}"
+        f"gemini-3.8-flash:generateContent?key={api_key}"
     )
 
     payload = {
@@ -295,7 +295,7 @@ def _parse_and_merge(
         "counselling_mode": "ai_grounded",
         "counselling_mode_note": (
             parsed.get("ai_counselling_note")
-            or "Synthesized by Gemini 1.5 Flash using RAG-retrieved NCVET/DGT course evidence."
+            or "Synthesized by Gemini 3.8 Flash using RAG-retrieved NCVET/DGT course evidence."
         ),
         "is_demo_data": False,
     })
