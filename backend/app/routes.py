@@ -25,6 +25,8 @@ from .schemas import (
     ParentalResistanceTopic
 )
 from .consensus_engine import FamilyConsensusEngine
+from .rag_retriever import course_vector_store, build_rag_query
+from .rag_generator import generate_rag_consensus
 
 router = APIRouter(tags=["SkillSaathi API"])
 
@@ -226,7 +228,7 @@ def list_courses(
 
     return result
 
-# --- 6. Run Family Consensus Analysis ---
+# --- 6. Run Family Consensus Analysis (RAG-enhanced) ---
 @router.post("/families/{family_id}/analyze", response_model=ConsensusSummaryResponse, status_code=status.HTTP_200_OK)
 @router.post("/families/{family_id}/analysis", response_model=ConsensusSummaryResponse, status_code=status.HTTP_200_OK)
 def analyze_family_consensus(family_id: str, db: Session = Depends(get_db)):
@@ -248,7 +250,24 @@ def analyze_family_consensus(family_id: str, db: Session = Depends(get_db)):
             detail=f"Cannot run consensus analysis. Missing: {', '.join(missing)}."
         )
 
-    # Fetch courses for evaluation
+    student = family.student_data
+    parent = family.parent_data
+
+    # ------------------------------------------------------------------ #
+    # Step 1: RAG — Retrieve semantically relevant courses               #
+    # ------------------------------------------------------------------ #
+    if course_vector_store.is_ready():
+        rag_query = build_rag_query(student=student, parent=parent)
+        retrieved_courses = course_vector_store.retrieve(
+            query=rag_query,
+            top_k=3,
+            student=student,
+        )
+    else:
+        # Vector store not ready (first boot edge case); fall back to full DB scan
+        retrieved_courses = []
+
+    # Always keep full course list for the deterministic engine (it filters internally)
     course_records = db.query(CourseModel).all()
     courses_dict_list = [
         {
@@ -263,17 +282,43 @@ def analyze_family_consensus(family_id: str, db: Session = Depends(get_db)):
             "certification_body": c.certification_body,
             "eligibility": c.eligibility,
             "career_outcome": c.career_outcome,
-            "location": c.location
+            "location": c.location,
+            "description": c.description,
+            "highlights": c.highlights,
+            "skills_acquired": c.skills_acquired,
+            "career_progression": c.career_progression,
+            "missing_evidence_flags": c.missing_evidence_flags or [],
+            "verification_status": c.verification_status,
         }
         for c in course_records
     ]
 
+    # If RAG store was not ready, use full list as retrieved context
+    if not retrieved_courses:
+        retrieved_courses = courses_dict_list[:4]
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Deterministic base analysis (always runs)                  #
+    # ------------------------------------------------------------------ #
     analysis = FamilyConsensusEngine.analyze_family(
         family_id=family_id,
-        student=family.student_data,
-        parent=family.parent_data,
-        courses=courses_dict_list
+        student=student,
+        parent=parent,
+        courses=courses_dict_list,
     )
+
+    # ------------------------------------------------------------------ #
+    # Step 3: RAG Generation — Gemini enhances with retrieved context    #
+    # ------------------------------------------------------------------ #
+    rag_enhanced = generate_rag_consensus(
+        family_id=family_id,
+        student=student,
+        parent=parent,
+        retrieved_courses=retrieved_courses,
+        base_analysis=analysis,
+    )
+    if rag_enhanced:
+        analysis = rag_enhanced
 
     # If post-confidence was previously submitted, preserve it
     if family.post_confidence_student is not None or family.post_confidence_parent is not None:

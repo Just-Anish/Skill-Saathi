@@ -6,6 +6,7 @@ from .database import engine, Base, SessionLocal
 from .models import CourseModel
 from .demo_courses_data import DEMO_COURSES
 from .routes import router
+from .rag_retriever import course_vector_store
 
 def seed_courses():
     db = SessionLocal()
@@ -125,12 +126,50 @@ def migrate_sqlite_schema():
         except Exception as e:
             print(f"[SkillSaathi Migration] Schema migration note: {e}")
 
+def _build_rag_index():
+    """Build the in-process course vector store after seeding."""
+    db = SessionLocal()
+    try:
+        course_records = db.query(CourseModel).all()
+        courses_dict = [
+            {
+                "id": c.id,
+                "title": c.title,
+                "stream": c.stream,
+                "description": c.description,
+                "highlights": c.highlights,
+                "skills_acquired": c.skills_acquired,
+                "career_outcome": c.career_outcome,
+                "certification_body": c.certification_body,
+                "nsqf_level": c.nsqf_level,
+                "practical_hours": c.practical_hours,
+                "location": c.location,
+                "fees_inr": c.fees_inr,
+                "financial_aid_available": c.financial_aid_available,
+                "duration_months": c.duration_months,
+                "training_mode": c.training_mode,
+                "eligibility": c.eligibility,
+                "career_progression": c.career_progression,
+                "missing_evidence_flags": c.missing_evidence_flags or [],
+                "verification_status": c.verification_status,
+            }
+            for c in course_records
+        ]
+        course_vector_store.build(courses_dict)
+        print(f"[SkillSaathi] RAG index built for {len(courses_dict)} courses.")
+    except Exception as e:
+        print(f"[SkillSaathi] RAG index build failed (non-fatal): {e}")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Ensure tables exist & seed demo courses
+    # Startup: Ensure tables exist, seed demo courses, build RAG index
     Base.metadata.create_all(bind=engine)
     migrate_sqlite_schema()
     seed_courses()
+    _build_rag_index()
     yield
     # Shutdown
 
