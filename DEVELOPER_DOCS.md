@@ -12,12 +12,12 @@
 - **Backend:** FastAPI (Python) at `http://127.0.0.1:8000` (proxied in development via Vite at `/api`). Uses SQLite/SQLAlchemy with **resilient fallback** to local mock data when offline or strict mode is disabled
 - **Storage:** Browser `sessionStorage` (ephemeral session data, active family ID, selected RAG model, strict mode toggle) + `localStorage` (language preference only)
 - **i18n:** Custom React Context provider. Supports `en`, `mr` (Marathi), `hi` (Hindi). Key stored in `localStorage` under `skillsaathi_language`
-- **AI/LLM & LangGraph Consensus Engine:** The FastAPI backend consensus pipeline is driven by an autonomous **LangGraph stateful self-correction graph** (`backend/app/rag_generator.py`):
+- **AI/LLM & LangGraph Consensus Engine:** The FastAPI backend consensus pipeline is driven by an autonomous **LangGraph stateful multi-agent debate and self-correction graph** (`backend/app/rag_generator.py`, `backend/app/agents.py`):
   - **Dense Embeddings:** `gemini-embedding-2` vector embeddings for course catalog and query vectorization (pure-Python TF-IDF fallback when API key is absent)
-  - **State Machine (`ConsensusState` TypedDict):** Shared execution context tracking `student_profile`, `parent_profile`, `retrieved_courses`, `base_analysis`, `model_name`, `family_id`, `generation_attempts` (int), `errors` (list of strings), `raw_llm_text`, and `final_parsed_response` (dict)
-  - **Generator Node:** Invokes `ChatGoogleGenerativeAI` with user profiles and retrieved course context. On retries, it inspects `state["errors"]` and injects exact Pydantic schema validation failures into the prompt to force model self-correction
-  - **Evaluator Node:** Parses raw LLM JSON, coerces numeric recommendation fields, and validates the output against the `ConsensusSummaryResponse` Pydantic model. If validation succeeds, it writes `final_parsed_response`; if validation fails, it extracts error strings into `state["errors"]` and increments `generation_attempts`
-  - **Self-Healing Cycle & Routing:** If valid → routes to `END`. If `generation_attempts < 3` → routes back to **Generator Node** with schema error feedback. If `generation_attempts >= 3` → routes to **Fallback Node** returning safe deterministic defaults, preventing backend 500 crashes
+  - **State Machine (`ConsensusState` TypedDict):** Shared execution context tracking `student_profile`, `parent_profile`, `retrieved_courses`, `base_analysis`, `model_name`, `family_id`, `student_argument` (str), `parent_argument` (str), `generation_attempts` (int), `errors` (list of strings), `raw_llm_text`, and `final_parsed_response` (dict)
+  - **Student & Parent Advocate Nodes:** Dedicated advocate agents in `backend/app/agents.py` analyzing profiles and retrieved courses using specialized system personas, generating dedicated arguments (`student_argument` championing passions/skills, `parent_argument` safeguarding financial ROI/stability)
+  - **Master Counselor Node:** Synthesizes both advocate arguments alongside retrieved courses into a balanced, empathetic consensus JSON payload (`raw_llm_text`)
+  - **Evaluator & Self-Healing Retry Loop:** Validates output against the `ConsensusSummaryResponse` Pydantic model. If validation fails, routes to the **Generator Node** (retry-only) with exact Pydantic schema validation errors injected into the prompt. If `attempts >= 3`, routes to **Fallback Node** returning safe deterministic defaults, preventing backend 500 crashes
 
 ```
 Frontend (SPA)
@@ -34,20 +34,28 @@ Frontend (SPA)
 Backend (FastAPI POST /families/{id}/analyze)
   ├── 1. Course Retrieval: gemini-embedding-2 dense vectors (or TF-IDF)
   ├── 2. Baseline Analysis: FamilyConsensusEngine (deterministic rule engine)
-  └── 3. LangGraph Self-Correction Pipeline (ConsensusState):
-        ┌────────────────────────────────────────────────────────┐
-        │                                                        │
-        │   ┌─────────────┐       raw_llm_text      ┌───────────┐│
-        │   │  Generator  │ ──────────────────────► │ Evaluator ││
-        │   └──────▲──────┘                         └─────┬─────┘│
-        │          │                                      │      │
-        │          │  Self-Healing Retry Loop             ├─► [Valid] ──────────────────────► END
-        │          │  (Injected Pydantic ValidationErrors)│
-        │          └──────────────────────────────────────┤
-        │                     (attempts < 3)              │
-        │                                                 └─► [attempts >= 3] ──► [Fallback] ─► END
-        │                                                                        (Deterministic)
-        └────────────────────────────────────────────────────────┘
+  └── 3. LangGraph Multi-Agent Debate & Self-Correction Pipeline (ConsensusState):
+        ┌────────────────────────────────────────────────────────────────────────┐
+        │                                                                        │
+        │   START ──► [Student Advocate] ──► [Parent Advocate]                   │
+        │               (passion/skills)       (cost/stability)                  │
+        │                                             │                          │
+        │                                             ▼                          │
+        │                                    [Master Counselor]                  │
+        │                                    (balanced JSON)                     │
+        │                                             │ raw_llm_text             │
+        │                                             ▼                          │
+        │   ┌──────────────────────────────────► [Evaluator] ◄───────────────┐   │
+        │   │                                         │                     │   │
+        │   │ retry (attempts < 3)                    ├─► [Valid] ──────►  END  │
+        │   │                                         │                         │
+        │   └─ [Generator Node] ◄─────────────────────┤                         │
+        │      (Injected Pydantic ValidationErrors)   │                         │
+        │                                             └─► [attempts >= 3] ──────┤
+        │                                                       ▼               │
+        │                                                  [Fallback] ──►  END  │
+        │                                                (Deterministic)        │
+        └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -218,11 +226,13 @@ User answers questions (AssessmentScreen)
                           │     │     │
                           │     │     ├─ Step 1: dense vector retrieval via gemini-embedding-2 (or TF-IDF fallback)
                           │     │     ├─ Step 2: base multi-perspective analysis (FamilyConsensusEngine)
-                          │     │     ├─ Step 3: LangGraph stateful consensus synthesis (ConsensusState):
-                          │     │     │     a. Generator Node: ChatGoogleGenerativeAI (model_name)
-                          │     │     │     b. Evaluator Node: Pydantic schema validation (ConsensusSummaryResponse)
-                          │     │     │     c. Self-healing loop: On validation failure, injects error feedback & re-prompts (< 3 attempts)
-                          │     │     │     d. Fallback Node: On >= 3 attempts, returns deterministic analysis safely
+                          │     │     ├─ Step 3: LangGraph multi-agent debate & consensus synthesis (ConsensusState):
+                          │     │     │     a. Student Advocate Node: Generates passionate career advocacy from student profile & courses
+                           │     │     │     b. Parent Advocate Node: Generates pragmatic ROI & security advocacy from parent concerns & budget
+                           │     │     │     c. Master Counselor Node: Synthesizes both arguments into balanced consensus JSON
+                          │     │     │     d. Evaluator Node: Pydantic schema validation (ConsensusSummaryResponse)
+                          │     │     │     e. Self-healing loop: On validation failure, re-prompts Generator Node with schema errors (< 3 attempts)
+                          │     │     │     f. Fallback Node: On >= 3 attempts, returns deterministic analysis safely
                           │     │     │
                           │     │     ├─ [Success / Grounded] → ConsensusSummaryData (counselling_mode: 'ai_grounded', counselling_model: model)
                           │     │     │  return { mode: 'live', summary, selectedModel }
@@ -448,9 +458,9 @@ type SupportedLanguage = 'en' | 'hi' | 'mr' | 'ta' | 'te' | 'bn' | 'gu' | 'kn' |
 - **Missing evidence flags:** `Course.missingEvidenceFlags[]` / `ConsensusRecommendation.missing_evidence_flags[]` — explicitly mark data gaps; use as negative signals or uncertainty annotations in RAG responses. **Now visually surfaced in `EvidencePanel.tsx`** via the inner `MissingEvidenceBadges` component — renders each flag string as an amber-styled badge beneath each pathway's rationale text. Empty or undefined arrays render nothing (zero noise when all evidence is present).
 
 
-### LangGraph Self-Correction Architecture (`backend/app/rag_generator.py`)
+### LangGraph Multi-Agent Debate & Self-Correction Architecture (`backend/app/rag_generator.py`, `backend/app/agents.py`)
 
-The RAG generation layer has been migrated from a linear pipeline to a **LangGraph stateful graph** that autonomously catches and corrects Pydantic schema violations before they can crash FastAPI.
+The RAG generation layer uses a **LangGraph stateful multi-agent debate architecture** wired directly into an autonomous self-correction loop. Dedicated persona advocate agents debate student interests and parental constraints before a Master Counselor synthesizes the consensus, which is then validated against strict Pydantic schemas.
 
 #### State: `ConsensusState` (TypedDict)
 
@@ -462,52 +472,75 @@ The RAG generation layer has been migrated from a linear pipeline to a **LangGra
 | `base_analysis` | `Dict[str, Any]` | Deterministic engine output (always valid baseline) |
 | `model_name` | `str` | Gemini model selected by the caller (`gemini-3.8-flash` default) |
 | `family_id` | `str` | For logging and tracing |
-| `generation_attempts` | `int` | Incremented by Generator on each call |
-| `errors` | `List[str]` | Accumulated Pydantic `ValidationError` strings — injected back into the correction prompt |
-| `raw_llm_text` | `Optional[str]` | Raw text returned by the LLM |
+| `student_argument` | `str` | Argument generated by `student_advocate_node` championing student aspirations, skills, and course alignment |
+| `parent_argument` | `str` | Argument generated by `parent_advocate_node` safeguarding family budget ceilings, accreditation, and stability |
+| `generation_attempts` | `int` | Incremented by Master Counselor and retry Generator |
+| `errors` | `List[str]` | Accumulated Pydantic `ValidationError` strings — injected into retry prompts |
+| `raw_llm_text` | `Optional[str]` | Raw text returned by Master Counselor or retry Generator |
 | `final_parsed_response` | `Optional[Dict[str, Any]]` | Set on success; presence signals graph completion |
 
 #### Graph Topology
 
 ```
-                    ┌─────────────┐
-  ENTRY ──────────► │  Generator  │ ◄──── (retry loop)
-                    └──────┬──────┘
-                           │ raw_llm_text
-                    ┌──────▼──────┐
-                    │  Evaluator  │
-                    └──────┬──────┘
-                           │
-           ┌───────────────┼───────────────┐
-           │               │               │
-    success│         retry │    attempts   │ >= MAX_RETRIES
-           │               │               │
-          END        (back to         ┌────▼────┐
-                      Generator)      │Fallback │
-                                      └────┬────┘
-                                           │
-                                          END
+  START
+    │
+    ▼
+[student_advocate] ────────► Calls student_advocate_agent() → writes state["student_argument"]
+    │
+    ▼
+[parent_advocate]  ────────► Calls parent_advocate_agent()  → writes state["parent_argument"]
+    │
+    ▼
+[master_counselor] ────────► First-pass synthesis using both advocate arguments + context → raw_llm_text
+    │
+    ▼
+[evaluator] ◄──────────────┐
+    │                      │ raw_llm_text (retry)
+    ├── [valid] ───────────┼──────────────────────────────────────────► END
+    │                      │
+    ├── [retry] ────────► [generator] (injects accumulated ValidationError strings into prompt)
+    │   (attempts < 3)
+    │
+    └── [exhausted] ────► [fallback]  (returns deterministic base_analysis) ──► END
+        (attempts >= 3)
 ```
 
-#### Nodes
+#### Nodes & Agents
 
-| Node | Behaviour |
-|---|---|
-| **Generator** | Instantiates `ChatGoogleGenerativeAI(model=model_name)`. On first attempt: sends grounding prompt. On retry: prepends `_CORRECTION_PREAMBLE` listing the exact Pydantic error strings from `state["errors"]` so the model knows precisely which field types to fix. |
-| **Evaluator** | Parses JSON → checks `_REQUIRED_KEYS` → coerces numeric recommendation fields → merges with `base_analysis` → runs `ConsensusSummaryResponse.model_validate()`. On `ValidationError`: extracts per-field error strings, appends to `state["errors"]`, leaves `final_parsed_response=None`. On success: writes `final_parsed_response`. |
-| **Fallback** | Reached when `generation_attempts >= MAX_RETRIES` (3). Returns `base_analysis` tagged `counselling_mode='deterministic'`. Never crashes. |
+| Node / Agent | Module | Behaviour |
+|---|---|---|
+| **Student Advocate** | `backend/app/agents.py` | Standalone agent (`student_advocate_agent`) prompted with `STUDENT_ADVOCATE_SYSTEM_PROMPT`. Evaluates student interests, hands-on activities, and retrieved course curricula to build an evidence-grounded advocacy statement. Writes to `state["student_argument"]`. Has deterministic baseline if API key is missing. |
+| **Parent Advocate** | `backend/app/agents.py` | Standalone agent (`parent_advocate_agent`) prompted with `PARENT_ADVOCATE_SYSTEM_PROMPT`. Scrutinizes parental concerns, fee ceilings (`max_total_fees_inr`), accreditation (NCVET/DGT), and career outcomes to build a risk-sensitive advocacy statement. Writes to `state["parent_argument"]`. Has deterministic baseline if API key is missing. |
+| **Master Counselor** | `backend/app/rag_generator.py` | Ingests both `student_argument` and `parent_argument` along with course catalog and base analysis. Uses `_MASTER_COUNSELOR_SYSTEM` prompt to produce first-pass consensus JSON in `state["raw_llm_text"]`. Increments `generation_attempts`. |
+| **Evaluator** | `backend/app/rag_generator.py` | Parses JSON → checks `_REQUIRED_KEYS` → coerces numeric recommendation fields → merges with `base_analysis` → validates against `ConsensusSummaryResponse`. On `ValidationError`: appends error strings to `state["errors"]` and leaves `final_parsed_response=None`. On success: writes `final_parsed_response`. |
+| **Generator (Retry)** | `backend/app/rag_generator.py` | Retry-only node invoked on schema failure. Prepends `_CORRECTION_PREAMBLE` listing exact Pydantic error strings from `state["errors"]` so the model corrects missing or mistyped fields. Sets `state["raw_llm_text"]` and increments `generation_attempts`. |
+| **Fallback** | `backend/app/rag_generator.py` | Reached when `generation_attempts >= MAX_RETRIES` (3). Returns safe `base_analysis` tagged `counselling_mode='deterministic'`. Never crashes. |
 
 #### Conditional Routing (`_route_after_evaluator`)
 
 ```python
-if state["final_parsed_response"] is not None:  → END
-if state["generation_attempts"] >= MAX_RETRIES:  → "fallback"
-else:                                             → "generator"   # self-correction retry
+def _route_after_evaluator(state: ConsensusState) -> str:
+    if state["final_parsed_response"] is not None:
+        return "end"
+    if state["generation_attempts"] >= MAX_RETRIES:
+        return "fallback"
+    return "generator"
 ```
 
 #### Error Surface Behavior (unchanged from caller's perspective)
 
-`generate_rag_consensus()` only returns `(None, error_string)` for **pre-flight failures** (missing `GEMINI_API_KEY`, empty retrieved courses). All schema self-correction failures are handled transparently inside the graph — the fallback node always produces a valid `final_parsed_response`. The `strict` query parameter on `POST /families/{id}/analyze` still controls whether pre-flight errors surface as HTTP 502.
+`generate_rag_consensus()` maintains its exact public signature:
+```python
+generate_rag_consensus(
+    family_id: str,
+    student: Dict[str, Any],
+    parent: Dict[str, Any],
+    retrieved_courses: List[Dict[str, Any]],
+    base_analysis: Dict[str, Any],
+    model_name: str = "gemini-3.8-flash",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]
+```
+It only returns `(None, error_string)` for **pre-flight failures** (missing `GEMINI_API_KEY`, empty retrieved courses). All schema self-correction failures are handled transparently inside the graph — the fallback node always produces a valid `final_parsed_response`. The `strict` query parameter on `POST /families/{id}/analyze` still controls whether pre-flight errors surface as HTTP 502.
 
 #### New Dependencies (`backend/requirements.txt`)
 
@@ -524,7 +557,7 @@ The RAG pipeline utilizes the following Google Gemini models:
 | Component | Model Identifier | API Endpoint / Method | Role & Description | Fallback Mechanism |
 |---|---|---|---|---|
 | **Course & Query Embeddings** | `gemini-embedding-2` | `models/gemini-embedding-2:batchEmbedContents`<br>`models/gemini-embedding-2:embedContent` | Ingestion & query vectorization (`taskType: RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`). Embeds course titles, descriptions, NSQF levels, eligibility, and curriculum highlights. | Pure-Python in-memory TF-IDF vectorizer + cosine similarity ranking (`_use_vectors=False`). |
-| **Consensus Report Synthesis** | `gemini-3.8-flash` (default)<br>`gemini-3.6-flash`<br>`gemini-3.5-flash-lite`<br>`gemini-3.1-flash-lite` | `models/{model}:generateContent` via `ChatGoogleGenerativeAI` | LangGraph Generator Node: grounded multi-perspective consensus synthesis with autonomous self-correction loop (up to 3 retries with Pydantic error injection). Sets `counselling_model` in response. | LangGraph Fallback Node returns `base_analysis` (deterministic). |
+| **Consensus Report Synthesis** | `gemini-3.8-flash` (default)<br>`gemini-3.6-flash`<br>`gemini-3.5-flash-lite`<br>`gemini-3.1-flash-lite` | `models/{model}:generateContent` via `ChatGoogleGenerativeAI` | LangGraph Multi-Agent Debate: Student Advocate, Parent Advocate, and Master Counselor pipeline with autonomous self-correction loop (up to 3 retries with Pydantic error injection). Sets `counselling_model` in response. | LangGraph Fallback Node returns `base_analysis` (deterministic). |
 | **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. | Returns base deterministic analysis unchanged. |
 
 ### Strict RAG Mode & Error Handling
