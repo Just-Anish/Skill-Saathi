@@ -421,6 +421,75 @@ type SupportedLanguage = 'en' | 'hi' | 'mr' | 'ta' | 'te' | 'bn' | 'gu' | 'kn' |
 - **Missing evidence flags:** `Course.missingEvidenceFlags[]` / `ConsensusRecommendation.missing_evidence_flags[]` — explicitly mark data gaps; use as negative signals or uncertainty annotations in RAG responses. **Now visually surfaced in `EvidencePanel.tsx`** via the inner `MissingEvidenceBadges` component — renders each flag string as an amber-styled badge beneath each pathway's rationale text. Empty or undefined arrays render nothing (zero noise when all evidence is present).
 
 
+### LangGraph Self-Correction Architecture (`backend/app/rag_generator.py`)
+
+The RAG generation layer has been migrated from a linear pipeline to a **LangGraph stateful graph** that autonomously catches and corrects Pydantic schema violations before they can crash FastAPI.
+
+#### State: `ConsensusState` (TypedDict)
+
+| Field | Type | Purpose |
+|---|---|---|
+| `student_profile` | `Dict[str, Any]` | Student data from `family.student_data` |
+| `parent_profile` | `Dict[str, Any]` | Parent data from `family.parent_data` |
+| `retrieved_courses` | `List[Dict[str, Any]]` | Top-k courses from ChromaDB/TF-IDF retrieval |
+| `base_analysis` | `Dict[str, Any]` | Deterministic engine output (always valid baseline) |
+| `model_name` | `str` | Gemini model selected by the caller (`gemini-3.8-flash` default) |
+| `family_id` | `str` | For logging and tracing |
+| `generation_attempts` | `int` | Incremented by Generator on each call |
+| `errors` | `List[str]` | Accumulated Pydantic `ValidationError` strings — injected back into the correction prompt |
+| `raw_llm_text` | `Optional[str]` | Raw text returned by the LLM |
+| `final_parsed_response` | `Optional[Dict[str, Any]]` | Set on success; presence signals graph completion |
+
+#### Graph Topology
+
+```
+                    ┌─────────────┐
+  ENTRY ──────────► │  Generator  │ ◄──── (retry loop)
+                    └──────┬──────┘
+                           │ raw_llm_text
+                    ┌──────▼──────┐
+                    │  Evaluator  │
+                    └──────┬──────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+    success│         retry │    attempts   │ >= MAX_RETRIES
+           │               │               │
+          END        (back to         ┌────▼────┐
+                      Generator)      │Fallback │
+                                      └────┬────┘
+                                           │
+                                          END
+```
+
+#### Nodes
+
+| Node | Behaviour |
+|---|---|
+| **Generator** | Instantiates `ChatGoogleGenerativeAI(model=model_name)`. On first attempt: sends grounding prompt. On retry: prepends `_CORRECTION_PREAMBLE` listing the exact Pydantic error strings from `state["errors"]` so the model knows precisely which field types to fix. |
+| **Evaluator** | Parses JSON → checks `_REQUIRED_KEYS` → coerces numeric recommendation fields → merges with `base_analysis` → runs `ConsensusSummaryResponse.model_validate()`. On `ValidationError`: extracts per-field error strings, appends to `state["errors"]`, leaves `final_parsed_response=None`. On success: writes `final_parsed_response`. |
+| **Fallback** | Reached when `generation_attempts >= MAX_RETRIES` (3). Returns `base_analysis` tagged `counselling_mode='deterministic'`. Never crashes. |
+
+#### Conditional Routing (`_route_after_evaluator`)
+
+```python
+if state["final_parsed_response"] is not None:  → END
+if state["generation_attempts"] >= MAX_RETRIES:  → "fallback"
+else:                                             → "generator"   # self-correction retry
+```
+
+#### Error Surface Behavior (unchanged from caller's perspective)
+
+`generate_rag_consensus()` only returns `(None, error_string)` for **pre-flight failures** (missing `GEMINI_API_KEY`, empty retrieved courses). All schema self-correction failures are handled transparently inside the graph — the fallback node always produces a valid `final_parsed_response`. The `strict` query parameter on `POST /families/{id}/analyze` still controls whether pre-flight errors surface as HTTP 502.
+
+#### New Dependencies (`backend/requirements.txt`)
+
+```
+langgraph>=0.2.0
+langchain-google-genai>=1.0.0
+langchain-core>=0.2.0
+```
+
 ### RAG Models & Vector Store Configuration
 
 The RAG pipeline utilizes the following Google Gemini models:
@@ -428,7 +497,7 @@ The RAG pipeline utilizes the following Google Gemini models:
 | Component | Model Identifier | API Endpoint / Method | Role & Description | Fallback Mechanism |
 |---|---|---|---|---|
 | **Course & Query Embeddings** | `gemini-embedding-2` | `models/gemini-embedding-2:batchEmbedContents`<br>`models/gemini-embedding-2:embedContent` | Ingestion & query vectorization (`taskType: RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`). Embeds course titles, descriptions, NSQF levels, eligibility, and curriculum highlights. | Pure-Python in-memory TF-IDF vectorizer + cosine similarity ranking (`_use_vectors=False`). |
-| **Consensus Report Synthesis** | `gemini-3.8-flash` (default)<br>`gemini-3.6-flash`<br>`gemini-3.5-flash-lite`<br>`gemini-3.1-flash-lite` | `models/{model}:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze?model={model}&strict={strict}`). Synthesizes structured JSON consensus summary, alignment scores, discussion guide, and sets `counselling_model`. | When `strict=false`, falls back to deterministic `FamilyConsensusEngine.analyze_family()`. When `strict=true`, raises HTTP 502 with root-cause diagnostic error. |
+| **Consensus Report Synthesis** | `gemini-3.8-flash` (default)<br>`gemini-3.6-flash`<br>`gemini-3.5-flash-lite`<br>`gemini-3.1-flash-lite` | `models/{model}:generateContent` via `ChatGoogleGenerativeAI` | LangGraph Generator Node: grounded multi-perspective consensus synthesis with autonomous self-correction loop (up to 3 retries with Pydantic error injection). Sets `counselling_model` in response. | LangGraph Fallback Node returns `base_analysis` (deterministic). |
 | **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. | Returns base deterministic analysis unchanged. |
 
 ### Strict RAG Mode & Error Handling

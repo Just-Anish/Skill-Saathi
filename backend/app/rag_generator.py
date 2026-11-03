@@ -1,22 +1,94 @@
 """
-SkillSaathi RAG Generation Layer
-Passes retrieved course context + family profile to Gemini to synthesize
-the full ConsensusSummaryData JSON. Falls back gracefully to the deterministic
-consensus engine when GEMINI_API_KEY is absent or the LLM call fails.
+SkillSaathi RAG Generation Layer — LangGraph Self-Correction Architecture
+=========================================================================
+Replaces the linear pipeline with a stateful LangGraph graph that:
+
+  1. Generator Node  — calls ChatGoogleGenerativeAI (Gemini) with the full
+                       grounding prompt. On retry iterations it appends the
+                       prior ValidationError string so the model can correct
+                       its own JSON schema mistakes.
+
+  2. Evaluator Node  — validates the raw LLM text against the existing
+                       ConsensusSummaryResponse Pydantic model.
+                       • Success → writes `final_parsed_response`, routes to END.
+                       • Failure → appends ValidationError to `errors`,
+                                   increments `generation_attempts`.
+
+  3. Conditional Edge — if attempts >= MAX_RETRIES → Fallback Node (safe
+                        deterministic defaults).
+                        Otherwise → back to Generator Node.
+
+  4. Fallback Node   — returns the deterministic base_analysis dict untouched,
+                       tagged as counselling_mode='deterministic'.
+
+Public surface:
+  generate_rag_consensus(family_id, student, parent, retrieved_courses,
+                          base_analysis, model_name) -> (dict | None, str | None)
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import urllib.request
-import urllib.error
-from typing import Dict, Any, List, Optional
+import re
+from typing import Any, Dict, List, Optional, TypedDict
+
+from pydantic import ValidationError
 
 from .config import settings
+from .schemas import ConsensusSummaryResponse
+
+# LangGraph / LangChain imports
+from langgraph.graph import StateGraph, END
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger("skillsaathi.rag_generator")
 
 # ---------------------------------------------------------------------------
-# Prompt construction
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES = 3  # after 3 failed attempts → deterministic fallback
+
+_VALID_READINESS = {"high", "moderate", "requires_dialogue"}
+
+_REQUIRED_KEYS = {
+    "overall_consensus_readiness",
+    "student_priorities",
+    "parent_priorities",
+    "shared_strengths",
+    "identified_disagreements",
+    "unresolved_concerns",
+    "top_pathway_recommendations",
+    "discussion_guide",
+}
+
+# ---------------------------------------------------------------------------
+# LangGraph State
+# ---------------------------------------------------------------------------
+
+class ConsensusState(TypedDict):
+    """Mutable state passed between every node in the LangGraph graph."""
+    # Input context (set once at graph invocation)
+    student_profile: Dict[str, Any]
+    parent_profile: Dict[str, Any]
+    retrieved_courses: List[Dict[str, Any]]
+    base_analysis: Dict[str, Any]
+    model_name: str
+    family_id: str
+
+    # Self-correction bookkeeping
+    generation_attempts: int
+    errors: List[str]
+
+    # Output
+    raw_llm_text: Optional[str]
+    final_parsed_response: Optional[Dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Prompt helpers  (preserved from original pipeline)
 # ---------------------------------------------------------------------------
 
 _SYSTEM_INSTRUCTION = """\
@@ -77,18 +149,17 @@ OUTPUT JSON SCHEMA (return exactly this structure):
 }
 """
 
+_CORRECTION_PREAMBLE = """\
+Your PREVIOUS response contained JSON schema errors that failed Pydantic validation.
+You MUST fix ALL of the following errors in your next response.
+Every field that requires a plain string must be a string — never a dict or list.
+Return ONLY the corrected JSON object with no markdown fences.
 
-def _build_generation_prompt(
-    student: Dict[str, Any],
-    parent: Dict[str, Any],
-    retrieved_courses: List[Dict[str, Any]],
-    base_analysis: Dict[str, Any],
-) -> str:
-    """
-    Compose the full grounded generation prompt.
-    Includes family profiles and the RAG-retrieved course context.
-    """
-    # Trim course data to only what is needed for the prompt (avoid token bloat)
+VALIDATION ERRORS FROM PREVIOUS ATTEMPT:
+"""
+
+
+def _build_courses_for_prompt(retrieved_courses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     courses_for_prompt = []
     for c in retrieved_courses:
         outcome = c.get("career_outcome") or {}
@@ -118,7 +189,21 @@ def _build_generation_prompt(
             "missing_evidence_flags": (c.get("missing_evidence_flags") or [])[:2],
             "verification_status": c.get("verification_status"),
         })
+    return courses_for_prompt
 
+
+def _build_generation_prompt(
+    student: Dict[str, Any],
+    parent: Dict[str, Any],
+    retrieved_courses: List[Dict[str, Any]],
+    base_analysis: Dict[str, Any],
+    prior_errors: Optional[List[str]] = None,
+) -> str:
+    """
+    Compose the full grounded generation prompt.
+    When prior_errors is non-empty the prompt is prepended with a correction
+    instruction listing the exact Pydantic ValidationError messages.
+    """
     context = {
         "student_profile": {
             "education_level": student.get("education_level"),
@@ -136,13 +221,18 @@ def _build_generation_prompt(
             "degree_continuation_important": parent.get("degree_continuation_important"),
             "pre_confidence_score": parent.get("pre_confidence_score"),
         },
-        "retrieved_courses": courses_for_prompt,
+        "retrieved_courses": _build_courses_for_prompt(retrieved_courses),
         "deterministic_disagreements": base_analysis.get("identified_disagreements", [])[:2],
         "deterministic_shared_strengths": base_analysis.get("shared_strengths", [])[:2],
     }
 
+    prefix = ""
+    if prior_errors:
+        error_block = "\n".join(f"  - {e}" for e in prior_errors)
+        prefix = f"{_CORRECTION_PREAMBLE}{error_block}\n\n"
+
     return (
-        f"{_SYSTEM_INSTRUCTION}\n\n"
+        f"{prefix}{_SYSTEM_INSTRUCTION}\n\n"
         f"FAMILY & RETRIEVED COURSE CONTEXT:\n"
         f"{json.dumps(context, indent=2, ensure_ascii=False)}\n\n"
         f"Respond ONLY with valid JSON matching the schema above."
@@ -150,89 +240,8 @@ def _build_generation_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Gemini call
+# JSON text cleaning  (preserved from original)
 # ---------------------------------------------------------------------------
-
-def _call_gemini_generate(prompt: str, model_name: str = "gemini-3.8-flash") -> tuple[Optional[str], Optional[str]]:
-    """
-    Calls Gemini API for text generation.
-    Returns (raw_response_text, None) on success, or (None, error_description) on failure.
-    """
-    if not settings.GEMINI_API_KEY or not settings.GEMINI_API_KEY.strip():
-        return None, "GEMINI_API_KEY is missing or empty in backend/.env"
-
-    api_key = settings.GEMINI_API_KEY.strip()
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model_name}:generateContent?key={api_key}"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.25,
-            "responseMimeType": "application/json",
-            "maxOutputTokens": 4096,
-        },
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        timeout = max(settings.LLM_TIMEOUT_SECONDS, 30.0)  # RAG generation needs more time
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8"))
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        return parts[0].get("text", ""), None
-                return None, "Gemini returned candidates without content parts."
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
-        try:
-            err_json = json.loads(err_body)
-            msg = err_json.get("error", {}).get("message", err_body)
-        except Exception:
-            msg = err_body
-        logger.warning("[RAG-Gen] Gemini HTTP %s error (%s): %s", exc.code, model_name, msg)
-        return None, f"Gemini HTTP {exc.code}: {msg}"
-    except urllib.error.URLError as exc:
-        logger.warning("[RAG-Gen] Gemini connection error: %s", exc)
-        return None, f"Connection failed: {str(exc.reason)}"
-    except TimeoutError:
-        logger.warning("[RAG-Gen] Gemini timed out after %.1fs", settings.LLM_TIMEOUT_SECONDS)
-        return None, f"Gemini timed out after {settings.LLM_TIMEOUT_SECONDS}s"
-    except Exception as exc:
-        logger.warning("[RAG-Gen] Unexpected error calling Gemini: %s", exc)
-        return None, f"Unexpected error: {str(exc)}"
-
-    return None, "No response from Gemini API"
-
-
-# ---------------------------------------------------------------------------
-# Response parsing & merging
-# ---------------------------------------------------------------------------
-
-_REQUIRED_KEYS = {
-    "overall_consensus_readiness",
-    "student_priorities",
-    "parent_priorities",
-    "shared_strengths",
-    "identified_disagreements",
-    "unresolved_concerns",
-    "top_pathway_recommendations",
-    "discussion_guide",
-}
-
-_VALID_READINESS = {"high", "moderate", "requires_dialogue"}
-
 
 def _clean_json_text(raw: str) -> str:
     s = raw.strip()
@@ -245,45 +254,28 @@ def _clean_json_text(raw: str) -> str:
     return s.strip()
 
 
-def _parse_and_merge(
-    raw_text: str,
-    base_analysis: Dict[str, Any],
-    retrieved_courses: List[Dict[str, Any]],
-    model_name: str = "gemini-3.8-flash",
-) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    try:
-        parsed = json.loads(_clean_json_text(raw_text))
-    except json.JSONDecodeError as exc:
-        logger.warning("[RAG-Gen] JSON parse failed: %s", exc)
-        return None, f"Failed to parse JSON response: {str(exc)}"
+# ---------------------------------------------------------------------------
+# Recommendation coercion helper
+# ---------------------------------------------------------------------------
 
-    if not isinstance(parsed, dict):
-        logger.warning("[RAG-Gen] Unexpected response type: %s", type(parsed))
-        return None, "Model response was not a JSON dictionary"
+def _coerce_recommendations(recs: Any) -> List[Dict[str, Any]]:
+    """
+    Coerce each recommendation's numeric fields to int and set list defaults.
+    Returns only structurally valid recommendation dicts.
+    """
+    if not isinstance(recs, list):
+        return []
 
-    # Validate required keys present
-    missing_keys = _REQUIRED_KEYS - set(parsed.keys())
-    if missing_keys:
-        logger.warning("[RAG-Gen] Missing keys in LLM response: %s", missing_keys)
-        return None, f"Model response missing keys: {', '.join(missing_keys)}"
-
-    # Validate readiness value
-    readiness = parsed.get("overall_consensus_readiness", "moderate")
-    if readiness not in _VALID_READINESS:
-        parsed["overall_consensus_readiness"] = "moderate"
-
-    # Validate recommendations reference real retrieved course IDs
-    valid_ids = {c["id"] for c in retrieved_courses if "id" in c}
-    valid_recs = []
-    for rec in parsed.get("top_pathway_recommendations", []):
+    valid: List[Dict[str, Any]] = []
+    for rec in recs:
         if not isinstance(rec, dict):
             continue
-        # Allow through even if course_id not in retrieved (LLM may have used a real one)
         if "course_id" not in rec or "course_title" not in rec:
             continue
-        # Ensure numeric fields are actually numeric
-        for field in ("fit_score", "student_match_score", "parent_match_score",
-                      "duration_months", "fees_inr", "average_starting_salary_inr"):
+        for field in (
+            "fit_score", "student_match_score", "parent_match_score",
+            "duration_months", "fees_inr", "average_starting_salary_inr",
+        ):
             if field in rec and not isinstance(rec[field], (int, float)):
                 try:
                     rec[field] = int(rec[field])
@@ -294,17 +286,133 @@ def _parse_and_merge(
         rec.setdefault("limiting_factors", [])
         rec.setdefault("missing_evidence_flags", [])
         rec.setdefault("is_demo", True)
-        valid_recs.append(rec)
+        valid.append(rec)
 
+    return valid
+
+
+# ---------------------------------------------------------------------------
+# LangGraph Node: Generator
+# ---------------------------------------------------------------------------
+
+def generator_node(state: ConsensusState) -> ConsensusState:
+    """
+    Calls ChatGoogleGenerativeAI with the grounding prompt.
+    On retry iterations (errors non-empty) prepends a correction preamble
+    so the model knows exactly what schema mistakes to fix.
+    """
+    model_name = state["model_name"]
+    prior_errors = state.get("errors") or []
+
+    logger.info(
+        "[LangGraph][Generator] Attempt %d for family %s using %s",
+        state["generation_attempts"] + 1,
+        state["family_id"],
+        model_name,
+    )
+
+    prompt_text = _build_generation_prompt(
+        student=state["student_profile"],
+        parent=state["parent_profile"],
+        retrieved_courses=state["retrieved_courses"],
+        base_analysis=state["base_analysis"],
+        prior_errors=prior_errors if state["generation_attempts"] > 0 else None,
+    )
+
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=settings.GEMINI_API_KEY,
+            temperature=0.25,
+            max_output_tokens=4096,
+        )
+        response = llm.invoke([
+            SystemMessage(content="You are a precise JSON-only generation assistant. Never output markdown fences."),
+            HumanMessage(content=prompt_text),
+        ])
+        raw_text: Optional[str] = response.content if response and response.content else None
+    except Exception as exc:
+        logger.warning("[LangGraph][Generator] LLM call failed: %s", exc)
+        raw_text = None
+        new_errors = list(state.get("errors") or [])
+        new_errors.append(f"LLM call failed on attempt {state['generation_attempts'] + 1}: {str(exc)}")
+        return {
+            **state,
+            "raw_llm_text": None,
+            "generation_attempts": state["generation_attempts"] + 1,
+            "errors": new_errors,
+        }
+
+    return {
+        **state,
+        "raw_llm_text": raw_text,
+        "generation_attempts": state["generation_attempts"] + 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# LangGraph Node: Evaluator
+# ---------------------------------------------------------------------------
+
+def evaluator_node(state: ConsensusState) -> ConsensusState:
+    """
+    Validates the raw LLM text by:
+      1. JSON-parsing it.
+      2. Coercing recommendation numeric fields.
+      3. Merging with base_analysis to produce a full ConsensusSummaryResponse dict.
+      4. Running pydantic model_validate() — catches hallucinated field types.
+
+    On success  → writes `final_parsed_response`.
+    On failure  → appends error string to `errors`.
+    """
+    raw_text = state.get("raw_llm_text")
+    base_analysis = state["base_analysis"]
+    model_name = state["model_name"]
+
+    if not raw_text:
+        new_errors = list(state.get("errors") or [])
+        new_errors.append("Generator returned empty response.")
+        return {**state, "errors": new_errors}
+
+    # ── Step 1: Parse JSON ─────────────────────────────────────────────────
+    try:
+        parsed = json.loads(_clean_json_text(raw_text))
+    except json.JSONDecodeError as exc:
+        new_errors = list(state.get("errors") or [])
+        new_errors.append(f"JSON parse error: {exc}")
+        logger.warning("[LangGraph][Evaluator] JSON parse failed: %s", exc)
+        return {**state, "errors": new_errors}
+
+    if not isinstance(parsed, dict):
+        new_errors = list(state.get("errors") or [])
+        new_errors.append(f"Expected JSON object (dict), got {type(parsed).__name__}.")
+        return {**state, "errors": new_errors}
+
+    # ── Step 2: Structural key check ───────────────────────────────────────
+    missing_keys = _REQUIRED_KEYS - set(parsed.keys())
+    if missing_keys:
+        new_errors = list(state.get("errors") or [])
+        new_errors.append(f"LLM response missing required keys: {', '.join(sorted(missing_keys))}")
+        logger.warning("[LangGraph][Evaluator] Missing keys: %s", missing_keys)
+        return {**state, "errors": new_errors}
+
+    # ── Step 3: Coerce recommendations ─────────────────────────────────────
+    valid_recs = _coerce_recommendations(parsed.get("top_pathway_recommendations", []))
     if not valid_recs:
-        logger.warning("[RAG-Gen] No valid recommendations in LLM response.")
-        return None, "No valid course recommendations generated."
+        new_errors = list(state.get("errors") or [])
+        new_errors.append(
+            "top_pathway_recommendations is empty or all entries are structurally invalid. "
+            "Each recommendation must have 'course_id' and 'course_title' as plain strings."
+        )
+        return {**state, "errors": new_errors}
 
-    parsed["top_pathway_recommendations"] = valid_recs[:3]
+    # Fix readiness enum
+    if parsed.get("overall_consensus_readiness") not in _VALID_READINESS:
+        parsed["overall_consensus_readiness"] = "moderate"
 
-    # Merge into base analysis (preserving confidence, family_id, timestamps, etc.)
-    enhanced = dict(base_analysis)
-    enhanced.update({
+    # ── Step 4: Merge with base_analysis ───────────────────────────────────
+    candidate = dict(base_analysis)
+    candidate.update({
         "overall_consensus_readiness": parsed["overall_consensus_readiness"],
         "student_priorities": parsed.get("student_priorities") or base_analysis.get("student_priorities", []),
         "parent_priorities": parsed.get("parent_priorities") or base_analysis.get("parent_priorities", []),
@@ -322,7 +430,106 @@ def _parse_and_merge(
         "is_demo_data": False,
     })
 
-    return enhanced, None
+    # ── Step 5: Pydantic validation ─────────────────────────────────────────
+    try:
+        ConsensusSummaryResponse.model_validate(candidate)
+    except ValidationError as exc:
+        # Extract human-readable error strings for the correction prompt
+        error_strings: List[str] = []
+        for error in exc.errors():
+            loc = " -> ".join(str(l) for l in error["loc"])
+            msg = error["msg"]
+            error_strings.append(f"Field '{loc}': {msg}")
+
+        new_errors = list(state.get("errors") or [])
+        new_errors.extend(error_strings)
+        logger.warning(
+            "[LangGraph][Evaluator] Pydantic validation failed (%d errors): %s",
+            len(error_strings),
+            "; ".join(error_strings[:3]),
+        )
+        return {**state, "errors": new_errors}
+
+    # ── Success ────────────────────────────────────────────────────────────
+    logger.info(
+        "[LangGraph][Evaluator] Validation passed on attempt %d for family %s",
+        state["generation_attempts"],
+        state["family_id"],
+    )
+    return {**state, "final_parsed_response": candidate}
+
+
+# ---------------------------------------------------------------------------
+# LangGraph Node: Fallback
+# ---------------------------------------------------------------------------
+
+def fallback_node(state: ConsensusState) -> ConsensusState:
+    """
+    Invoked when MAX_RETRIES is exhausted.
+    Tags the deterministic base_analysis as the safe fallback output.
+    """
+    logger.warning(
+        "[LangGraph][Fallback] Max retries (%d) reached for family %s. "
+        "Returning deterministic base_analysis. Accumulated errors: %s",
+        MAX_RETRIES,
+        state["family_id"],
+        state.get("errors"),
+    )
+    fallback = dict(state["base_analysis"])
+    fallback.update({
+        "counselling_mode": "deterministic",
+        "counselling_model": None,
+        "counselling_mode_note": (
+            "AI generation exhausted after self-correction retries. "
+            "Evaluated using SkillSaathi Evidence-Grounded Consensus Engine."
+        ),
+        "is_demo_data": True,
+    })
+    return {**state, "final_parsed_response": fallback}
+
+
+# ---------------------------------------------------------------------------
+# Conditional routing
+# ---------------------------------------------------------------------------
+
+def _route_after_evaluator(state: ConsensusState) -> str:
+    """
+    Routing logic after the Evaluator node:
+      • Parsed successfully          → END
+      • Attempts exhausted           → "fallback"
+      • Otherwise                    → "generator"  (retry)
+    """
+    if state.get("final_parsed_response") is not None:
+        return END
+    if state["generation_attempts"] >= MAX_RETRIES:
+        return "fallback"
+    return "generator"
+
+
+# ---------------------------------------------------------------------------
+# Graph compilation  (module-level singleton)
+# ---------------------------------------------------------------------------
+
+def _build_graph() -> StateGraph:
+    graph = StateGraph(ConsensusState)
+
+    graph.add_node("generator", generator_node)
+    graph.add_node("evaluator", evaluator_node)
+    graph.add_node("fallback", fallback_node)
+
+    graph.set_entry_point("generator")
+    graph.add_edge("generator", "evaluator")
+    graph.add_conditional_edges("evaluator", _route_after_evaluator, {
+        END: END,
+        "generator": "generator",
+        "fallback": "fallback",
+    })
+    graph.add_edge("fallback", END)
+
+    return graph.compile()
+
+
+_consensus_graph = _build_graph()
 
 
 # ---------------------------------------------------------------------------
@@ -338,28 +545,49 @@ def generate_rag_consensus(
     model_name: str = "gemini-3.8-flash",
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Use Gemini to generate a ConsensusSummaryData dict grounded in the
-    RAG-retrieved courses. Returns (result_dict, error_string).
+    Invoke the LangGraph self-correction pipeline.
+
+    Returns:
+        (result_dict, None)        on success (ai_grounded or deterministic fallback)
+        (None, error_string)       only if GEMINI_API_KEY is missing or courses empty
+                                   (pre-flight failures; graph is never invoked)
     """
     if not settings.GEMINI_API_KEY or not settings.GEMINI_API_KEY.strip():
         return None, "GEMINI_API_KEY is not configured in backend/.env"
 
     if not retrieved_courses:
-        logger.warning("[RAG-Gen] No retrieved courses; skipping generation.")
+        logger.warning("[LangGraph] No retrieved courses; skipping RAG generation.")
         return None, "No relevant courses retrieved from vector store."
 
+    initial_state: ConsensusState = {
+        "student_profile": student,
+        "parent_profile": parent,
+        "retrieved_courses": retrieved_courses,
+        "base_analysis": base_analysis,
+        "model_name": model_name,
+        "family_id": family_id,
+        "generation_attempts": 0,
+        "errors": [],
+        "raw_llm_text": None,
+        "final_parsed_response": None,
+    }
+
     try:
-        prompt = _build_generation_prompt(student, parent, retrieved_courses, base_analysis)
-        raw, err = _call_gemini_generate(prompt, model_name=model_name)
-        if err or not raw:
-            return None, err or "Empty response from Gemini."
-        result, parse_err = _parse_and_merge(raw, base_analysis, retrieved_courses, model_name=model_name)
-        if parse_err:
-            return None, parse_err
-        if result:
-            logger.info("[RAG-Gen] AI-grounded consensus generated with %s for family %s", model_name, family_id)
-        return result, None
+        final_state: ConsensusState = _consensus_graph.invoke(initial_state)
     except Exception as exc:
-        logger.warning("[RAG-Gen] Unexpected error during RAG generation: %s", exc)
+        logger.warning("[LangGraph] Graph invocation failed: %s", exc)
         return None, f"Unexpected error during RAG generation: {str(exc)}"
 
+    result = final_state.get("final_parsed_response")
+    if result is not None:
+        logger.info(
+            "[LangGraph] Consensus generated for family %s (mode=%s, attempts=%d)",
+            family_id,
+            result.get("counselling_mode"),
+            final_state["generation_attempts"],
+        )
+        return result, None
+
+    # Should never reach here (fallback_node always sets final_parsed_response)
+    accumulated_errors = "; ".join(final_state.get("errors") or [])
+    return None, f"RAG generation failed after {MAX_RETRIES} attempts: {accumulated_errors}"

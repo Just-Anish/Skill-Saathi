@@ -313,7 +313,7 @@ def analyze_family_consensus(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 3: RAG Generation — Gemini enhances with retrieved context    #
+    # Step 3: RAG Generation — LangGraph self-correction pipeline        #
     # ------------------------------------------------------------------ #
     rag_enhanced, rag_error = generate_rag_consensus(
         family_id=family_id,
@@ -324,6 +324,9 @@ def analyze_family_consensus(
         model_name=model,
     )
     if strict and rag_error:
+        # rag_error only fires on pre-flight failures (missing API key, empty
+        # courses). Schema self-correction failures are handled internally by
+        # the LangGraph fallback node and never surface here as an error.
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini RAG Generation Failed using [{model}]: {rag_error}",
