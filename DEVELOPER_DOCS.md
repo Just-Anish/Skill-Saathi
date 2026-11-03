@@ -9,13 +9,18 @@
 - **Type:** Single-Page Application (SPA) — no server-side rendering, no routing library
 - **Rendering:** Custom in-app router implemented as a `switch` on `currentRoute` state in [`App.tsx`](src/app/App.tsx)
 - **State management:** Local React state only (`useState`, `useContext`). No Redux, Zustand, or similar
-- **Backend:** FastAPI (Python) expected at `http://127.0.0.1:8000` (proxied in development via Vite at `/api`). Frontend has **resilient fallback** to local mock data when backend is offline or strict mode is disabled
+- **Backend:** FastAPI (Python) at `http://127.0.0.1:8000` (proxied in development via Vite at `/api`). Uses SQLite/SQLAlchemy with **resilient fallback** to local mock data when offline or strict mode is disabled
 - **Storage:** Browser `sessionStorage` (ephemeral session data, active family ID, selected RAG model, strict mode toggle) + `localStorage` (language preference only)
 - **i18n:** Custom React Context provider. Supports `en`, `mr` (Marathi), `hi` (Hindi). Key stored in `localStorage` under `skillsaathi_language`
-- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and selectable Gemini models (default **`gemini-3.8-flash`**, with support for `gemini-3.6-flash`, `gemini-3.5-flash-lite`, and `gemini-3.1-flash-lite`) for grounded consensus report synthesis and AI counselling note generation. When `GEMINI_API_KEY` is not provided or RAG generation fails without strict mode, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. When Strict RAG Mode is enabled, generation errors surface directly (HTTP 502) with diagnostic error messages.
+- **AI/LLM & LangGraph Consensus Engine:** The FastAPI backend consensus pipeline is driven by an autonomous **LangGraph stateful self-correction graph** (`backend/app/rag_generator.py`):
+  - **Dense Embeddings:** `gemini-embedding-2` vector embeddings for course catalog and query vectorization (pure-Python TF-IDF fallback when API key is absent)
+  - **State Machine (`ConsensusState` TypedDict):** Shared execution context tracking `student_profile`, `parent_profile`, `retrieved_courses`, `base_analysis`, `model_name`, `family_id`, `generation_attempts` (int), `errors` (list of strings), `raw_llm_text`, and `final_parsed_response` (dict)
+  - **Generator Node:** Invokes `ChatGoogleGenerativeAI` with user profiles and retrieved course context. On retries, it inspects `state["errors"]` and injects exact Pydantic schema validation failures into the prompt to force model self-correction
+  - **Evaluator Node:** Parses raw LLM JSON, coerces numeric recommendation fields, and validates the output against the `ConsensusSummaryResponse` Pydantic model. If validation succeeds, it writes `final_parsed_response`; if validation fails, it extracts error strings into `state["errors"]` and increments `generation_attempts`
+  - **Self-Healing Cycle & Routing:** If valid → routes to `END`. If `generation_attempts < 3` → routes back to **Generator Node** with schema error feedback. If `generation_attempts >= 3` → routes to **Fallback Node** returning safe deterministic defaults, preventing backend 500 crashes
 
 ```
-Browser
+Frontend (SPA)
   └── I18nProvider (Context)
         └── App.tsx (in-app router via useState)
               └── AppShell (layout: Sidebar + Topbar + MobileNavigation)
@@ -25,6 +30,24 @@ Browser
                           CourseExplorer → CourseDetails
                           AssessmentScreen (intro → assessment → model_select → results) → AssessmentResults
                           PlaceholderSection (career-pathways, counsellor-support, admin)
+
+Backend (FastAPI POST /families/{id}/analyze)
+  ├── 1. Course Retrieval: gemini-embedding-2 dense vectors (or TF-IDF)
+  ├── 2. Baseline Analysis: FamilyConsensusEngine (deterministic rule engine)
+  └── 3. LangGraph Self-Correction Pipeline (ConsensusState):
+        ┌────────────────────────────────────────────────────────┐
+        │                                                        │
+        │   ┌─────────────┐       raw_llm_text      ┌───────────┐│
+        │   │  Generator  │ ──────────────────────► │ Evaluator ││
+        │   └──────▲──────┘                         └─────┬─────┘│
+        │          │                                      │      │
+        │          │  Self-Healing Retry Loop             ├─► [Valid] ──────────────────────► END
+        │          │  (Injected Pydantic ValidationErrors)│
+        │          └──────────────────────────────────────┤
+        │                     (attempts < 3)              │
+        │                                                 └─► [attempts >= 3] ──► [Fallback] ─► END
+        │                                                                        (Deterministic)
+        └────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -195,17 +218,21 @@ User answers questions (AssessmentScreen)
                           │     │     │
                           │     │     ├─ Step 1: dense vector retrieval via gemini-embedding-2 (or TF-IDF fallback)
                           │     │     ├─ Step 2: base multi-perspective analysis (FamilyConsensusEngine)
-                          │     │     ├─ Step 3: grounded synthesis via Google Gemini API (model_name=model)
+                          │     │     ├─ Step 3: LangGraph stateful consensus synthesis (ConsensusState):
+                          │     │     │     a. Generator Node: ChatGoogleGenerativeAI (model_name)
+                          │     │     │     b. Evaluator Node: Pydantic schema validation (ConsensusSummaryResponse)
+                          │     │     │     c. Self-healing loop: On validation failure, injects error feedback & re-prompts (< 3 attempts)
+                          │     │     │     d. Fallback Node: On >= 3 attempts, returns deterministic analysis safely
                           │     │     │
-                          │     │     ├─ [Success] → ConsensusSummaryData (counselling_mode: 'ai_grounded', counselling_model: model)
+                          │     │     ├─ [Success / Grounded] → ConsensusSummaryData (counselling_mode: 'ai_grounded', counselling_model: model)
                           │     │     │  return { mode: 'live', summary, selectedModel }
                           │     │     │
-                          │     │     └─ [Error & strict=true]
-                          │     │        Backend raises HTTP 502 Bad Gateway
+                          │     │     └─ [Pre-flight Error & strict=true]
+                          │     │        Backend raises HTTP 502 Bad Gateway (e.g. missing API key)
                           │     │        Frontend catches and displays error banner with model selector & retry
                           │     │        return { mode: 'live', error, selectedModel }
                           │     │
-                          │     └─ [Error & strict=false]
+                          │     └─ [Pre-flight Error & strict=false]
                           │        Backend silently falls back to deterministic analysis
                           │        return { mode: 'live', summary: deterministic, selectedModel }
                           │
