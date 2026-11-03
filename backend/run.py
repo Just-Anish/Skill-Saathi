@@ -1,6 +1,9 @@
 import sys
 import os
+from dotenv import load_dotenv
 
+# Explicitly point to the backend/.env file since you run the server from the root directory
+load_dotenv("backend/.env")
 # Ensure project root is in python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:

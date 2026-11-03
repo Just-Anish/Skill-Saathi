@@ -123,7 +123,6 @@ def student_advocate_agent(
     llm = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=settings.GEMINI_API_KEY.strip(),
-        temperature=0.35,
         max_output_tokens=1024,
     )
 
@@ -146,12 +145,16 @@ def student_advocate_agent(
         f"Build a powerful, evidence-grounded advocacy statement for this student's preferred vocational pathways."
     )
 
+    messages = [
+        SystemMessage(content=STUDENT_ADVOCATE_SYSTEM_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+
     try:
-        response = llm.invoke([
-            SystemMessage(content=STUDENT_ADVOCATE_SYSTEM_PROMPT),
-            HumanMessage(content=user_prompt),
-        ])
-        argument = response.content if response and response.content else ""
+        response = llm.invoke(messages)
+        raw = response.content if response and response.content else ""
+        # Gemini may return a list of content parts; coerce to str
+        argument = raw if isinstance(raw, str) else " ".join(str(p) for p in raw)
         return argument.strip()
     except Exception as exc:
         logger.warning("[StudentAdvocateAgent] Call failed (%s): %s", model_name, exc)
@@ -188,7 +191,6 @@ def parent_advocate_agent(
     llm = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=settings.GEMINI_API_KEY.strip(),
-        temperature=0.35,
         max_output_tokens=1024,
     )
 
@@ -211,12 +213,16 @@ def parent_advocate_agent(
         f"Build a rigorous, welfare-centered advocacy statement safeguarding this family's financial and stability priorities."
     )
 
+    messages = [
+        SystemMessage(content=PARENT_ADVOCATE_SYSTEM_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+
     try:
-        response = llm.invoke([
-            SystemMessage(content=PARENT_ADVOCATE_SYSTEM_PROMPT),
-            HumanMessage(content=user_prompt),
-        ])
-        argument = response.content if response and response.content else ""
+        response = llm.invoke(messages)
+        raw = response.content if response and response.content else ""
+        # Gemini may return a list of content parts; coerce to str
+        argument = raw if isinstance(raw, str) else " ".join(str(p) for p in raw)
         return argument.strip()
     except Exception as exc:
         logger.warning("[ParentAdvocateAgent] Call failed (%s): %s", model_name, exc)
