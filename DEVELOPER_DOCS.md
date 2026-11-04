@@ -9,10 +9,10 @@
 - **Type:** Single-Page Application (SPA) — no server-side rendering, no routing library
 - **Rendering:** Custom in-app router implemented as a `switch` on `currentRoute` state in [`App.tsx`](src/app/App.tsx)
 - **State management:** Local React state only (`useState`, `useContext`). No Redux, Zustand, or similar
-- **Backend:** FastAPI (Python) expected at `http://localhost:8000/api/v1`. Frontend has **resilient fallback** to local mock data when backend is offline
-- **Storage:** Browser `sessionStorage` (ephemeral session data) + `localStorage` (language preference only)
+- **Backend:** FastAPI (Python) expected at `http://127.0.0.1:8000` (proxied in development via Vite at `/api`). Frontend has **resilient fallback** to local mock data when backend is offline or strict mode is disabled
+- **Storage:** Browser `sessionStorage` (ephemeral session data, active family ID, selected RAG model, strict mode toggle) + `localStorage` (language preference only)
 - **i18n:** Custom React Context provider. Supports `en`, `mr` (Marathi), `hi` (Hindi). Key stored in `localStorage` under `skillsaathi_language`
-- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and **`gemini-3.8-flash`** for grounded consensus report synthesis and AI counselling note generation. When `GEMINI_API_KEY` is not provided, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. Frontend features resilient fallback.
+- **AI/LLM:** The FastAPI backend RAG pipeline utilizes Google Gemini: **`gemini-embedding-2`** for dense vector course embeddings and retrieval queries, and selectable Gemini models (default **`gemini-3.8-flash`**, with support for `gemini-3.6-flash`, `gemini-3.5-flash-lite`, and `gemini-3.1-flash-lite`) for grounded consensus report synthesis and AI counselling note generation. When `GEMINI_API_KEY` is not provided or RAG generation fails without strict mode, the backend falls back gracefully to deterministic rule-based scoring and pure-Python TF-IDF keyword retrieval. When Strict RAG Mode is enabled, generation errors surface directly (HTTP 502) with diagnostic error messages.
 
 ```
 Browser
@@ -23,7 +23,7 @@ Browser
                           HomeScreen
                           OnboardingFlow
                           CourseExplorer → CourseDetails
-                          AssessmentScreen → AssessmentResults
+                          AssessmentScreen (intro → assessment → model_select → results) → AssessmentResults
                           PlaceholderSection (career-pathways, counsellor-support, admin)
 ```
 
@@ -46,7 +46,7 @@ npm install
 
 # 3. Configure environment
 cp .env.example .env.local
-# Edit .env.local → set VITE_API_BASE_URL=http://localhost:8000/api/v1
+# Optional: Edit .env.local → set VITE_API_BASE_URL (defaults to '/api', proxied to http://127.0.0.1:8000 via Vite)
 
 # 4. Start dev server
 npm run dev
@@ -61,7 +61,9 @@ npm run build
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VITE_API_BASE_URL` | `''` (relative) | FastAPI backend base URL. Falls back to mock data if unreachable |
+| `VITE_API_BASE_URL` | `'/api'` (relative) | FastAPI backend base URL. Proxied to `http://127.0.0.1:8000` via Vite dev server |
+
+> **Backend Configuration:** FastAPI auto-loads environment variables from `backend/.env` or the workspace root `.env` via `python-dotenv`. Set `GEMINI_API_KEY` to activate real Gemini vector embeddings and generation.
 
 ---
 
@@ -94,7 +96,7 @@ npm run build
 - [`storage.ts`](src/features/onboarding/storage.ts) — `sessionStorage` CRUD for `OnboardingPreferences` under key `skillsaathi_demo_onboarding_prefs_v1`
 
 #### Career Assessment & Counselling (`src/features/counselling/`)
-- [`AssessmentScreen.tsx`](src/features/counselling/AssessmentScreen.tsx) — Orchestrator: shows questions → triggers backend consensus → shows results
+- [`AssessmentScreen.tsx`](src/features/counselling/AssessmentScreen.tsx) — Multi-step orchestrator: shows intro → questions → RAG model selection screen (`model_select`) → triggers backend consensus → displays results. Allows selecting the Gemini synthesis model (`AVAILABLE_GEMINI_MODELS`) and toggling Strict RAG Mode
 - [`assessmentTypes.ts`](src/features/counselling/assessmentTypes.ts) — All assessment type definitions (see Data Models)
 - [`assessmentQuestions.ts`](src/features/counselling/assessmentQuestions.ts) — Static question bank (localized, with conditional visibility via `isApplicable`)
 - [`assessmentService.ts`](src/features/counselling/assessmentService.ts) — Session persistence, answer validation, results generation
@@ -102,7 +104,7 @@ npm run build
 - [`CounsellingScreen.tsx`](src/features/counselling/CounsellingScreen.tsx) — Chat-style interface post-assessment
 - [`counsellingService.ts`](src/features/counselling/counsellingService.ts) — Keyword-matching response generator with 650ms simulated latency
 - [`counsellingContent.ts`](src/features/counselling/counsellingContent.ts) — Localized response templates, suggested questions, UI text
-- [`AssessmentResults.tsx`](src/features/counselling/AssessmentResults.tsx) — Results display; triggers `familyConsensusService.runFamilyConsensus()`
+- [`AssessmentResults.tsx`](src/features/counselling/AssessmentResults.tsx) — Results display; triggers `familyConsensusService.runFamilyConsensus()`. Includes interactive RAG model selector dropdown, Strict RAG checkbox, live status indicator, error banner with model retry and deterministic fallback link, and Grounded AI model attribution badge
 - [`EvidencePanel.tsx`](src/features/counselling/EvidencePanel.tsx) — Chat sidebar that pins a single `Course` and renders the consensus report (shared priorities, disagreements, pathway recommendations). Accepts optional `consensusRecommendations?: ConsensusRecommendation[]` prop (imported from `familyConsensusService`); inner `MissingEvidenceBadges` component renders `missing_evidence_flags[]` as amber warning badges (`bg:#fffbeb`, `color:#92400e`, `border:#fde68a`) beneath each recommendation's student/parent rationale. Renders nothing when the flags array is empty or undefined. Badge section appears in both the active-course panel and the empty-panel fallback.
 
 #### Course Explorer (`src/features/courses/`)
@@ -114,9 +116,9 @@ npm run build
 ### Services
 
 #### API Layer (`src/services/api/`)
-- [`client.ts`](src/services/api/client.ts) — `ApiClient` class: typed `fetch` wrapper with `GET/POST/PUT/PATCH/DELETE`. Reads `VITE_API_BASE_URL`. Throws `ApiError` (with `.status`, `.details`) on non-2xx responses
+- [`client.ts`](src/services/api/client.ts) — `ApiClient` class: typed `fetch` wrapper with `GET/POST/PUT/PATCH/DELETE`. Defaults `baseUrl` to `import.meta.env.VITE_API_BASE_URL || '/api'` (proxied to `http://127.0.0.1:8000`). Throws `ApiError` (with `.status`, `.details`) on non-2xx responses
 - [`endpoints.ts`](src/services/api/endpoints.ts) — Centralized endpoint constants (`ENDPOINTS.*`)
-- [`familyConsensusService.ts`](src/services/api/familyConsensusService.ts) — Core consensus orchestrator (see Data Flow)
+- [`familyConsensusService.ts`](src/services/api/familyConsensusService.ts) — Core consensus orchestrator. Exports `AVAILABLE_GEMINI_MODELS` and `GeminiModelId`. Calls `POST /families/{id}/analyze?model={model}&strict={strict}`. Supports Strict RAG Mode returning error diagnostics instead of silent demo fallback
 
 #### Course Service (`src/services/courses/`)
 - [`courseService.ts`](src/services/courses/courseService.ts) — `CourseService` class with in-memory cache (`cachedCourses`). Methods: `getAllCourses()`, `getCourseById()`, `filterCourses()`, `checkLiveStatus()`
@@ -147,6 +149,8 @@ npm run build
 | Onboarding prefs | `sessionStorage` | `skillsaathi_demo_onboarding_prefs_v1` | `OnboardingPreferences` JSON | Session only |
 | Assessment session | `sessionStorage` | `skillsaathi_career_guidance_session` | `{ answers, activeQuestionIndex, isCompleted, familyId, updatedAt }` | Session only |
 | Active family ID | `sessionStorage` | `skillsaathi_active_family_id` | FastAPI family UUID string | Session only |
+| Selected RAG model | `sessionStorage` | `skillsaathi_rag_model` | Selected Gemini model ID (e.g. `'gemini-3.8-flash'`) | Session only |
+| Strict RAG mode | `sessionStorage` | `skillsaathi_strict_rag` | `'true' \| 'false'` (defaults to true) | Session only |
 | Course bookmark state | Component/feature state | — | `Set<string>` of course IDs | In-memory only (not persisted) |
 
 > **RAG Note:** No database is connected to the frontend. All persistent state is browser-only. The FastAPI backend is the source of truth for course and family data.
@@ -166,27 +170,48 @@ User answers questions (AssessmentScreen)
   │
   ├─ assessmentService.saveSession() → sessionStorage (incremental)
   │
-  └─ On submit: assessmentService.generateResults(answers)
+  └─ On question completion: transition to 'model_select' view
         │
-        ├─ careerRecommendationService.generateInterestsSummary(answers)  [local]
-        ├─ careerRecommendationService.matchCareerPaths(answers)          [local, scores MOCK_COURSES]
-        ├─ careerRecommendationService.generateDiscussionPoints(answers)   [local]
-        └─ careerRecommendationService.generateNextSteps()                 [local]
+        ├─ User selects Gemini model (gemini-3.8-flash, gemini-3.6-flash, etc.)
+        ├─ User configures Strict RAG Mode (on/off)
+        │     → choices persisted to sessionStorage
+        │
+        └─ On "Launch RAG Family Consensus": transition to 'results' (AssessmentResults)
+              │
+              ├─ careerRecommendationService.generateInterestsSummary(answers)  [local]
+              ├─ careerRecommendationService.matchCareerPaths(answers)          [local, scores MOCK_COURSES]
+              ├─ careerRecommendationService.generateDiscussionPoints(answers)   [local]
+              ├─ careerRecommendationService.generateNextSteps()                 [local]
               │
               └─ AssessmentResults renders; triggers:
-                    familyConsensusService.runFamilyConsensus(answers)
+                    familyConsensusService.runFamilyConsensus(answers, language, model, strict)
                           │
                           ├─ [LIVE PATH] apiClient.get('/health') → ok
                           │     ├─ POST /families  → { id }
                           │     │     sessionStorage.setItem('skillsaathi_active_family_id', id)
                           │     ├─ POST /families/{id}/student  ← mapped from answers
                           │     ├─ POST /families/{id}/parent   ← hardcoded defaults + mapped concerns
-                          │     ├─ POST /families/{id}/analyze  → ConsensusSummaryData
-                          │     └─ return { mode: 'live', summary }
+                          │     ├─ POST /families/{id}/analyze?model={model}&strict={strict}
+                          │     │     │
+                          │     │     ├─ Step 1: dense vector retrieval via gemini-embedding-2 (or TF-IDF fallback)
+                          │     │     ├─ Step 2: base multi-perspective analysis (FamilyConsensusEngine)
+                          │     │     ├─ Step 3: grounded synthesis via Google Gemini API (model_name=model)
+                          │     │     │
+                          │     │     ├─ [Success] → ConsensusSummaryData (counselling_mode: 'ai_grounded', counselling_model: model)
+                          │     │     │  return { mode: 'live', summary, selectedModel }
+                          │     │     │
+                          │     │     └─ [Error & strict=true]
+                          │     │        Backend raises HTTP 502 Bad Gateway
+                          │     │        Frontend catches and displays error banner with model selector & retry
+                          │     │        return { mode: 'live', error, selectedModel }
+                          │     │
+                          │     └─ [Error & strict=false]
+                          │        Backend silently falls back to deterministic analysis
+                          │        return { mode: 'live', summary: deterministic, selectedModel }
                           │
-                          └─ [DEMO PATH] health check fails or backend throws
+                          └─ [FALLBACK PATH] backend offline or unhandled error (strict=false)
                                 generateLocalFallback(answers) → ConsensusSummaryData (static template)
-                                return { mode: 'demo', summary }
+                                return { mode: 'demo', summary, selectedModel }
 ```
 
 ### API Endpoints (Defined, Backend Expected)
@@ -201,7 +226,7 @@ User answers questions (AssessmentScreen)
 | `POST` | `/families` | Create family session; body: `{ family_name, language, district, state }` |
 | `POST` | `/families/{id}/student` | Submit student profile |
 | `POST` | `/families/{id}/parent` | Submit parent profile |
-| `POST` | `/families/{id}/analyze` | Run consensus engine → `ConsensusSummaryData` |
+| `POST` | `/families/{id}/analyze` | Run consensus engine → `ConsensusSummaryData`. Supports query params: `model` (default: `'gemini-3.8-flash'`), `strict` (boolean, default: `false`; returns HTTP 502 with diagnostic details on Gemini RAG failure instead of fallback). Alias: `/families/{id}/analysis` |
 | `GET` | `/families/{id}/summary` | Fetch existing consensus summary |
 | `POST` | `/families/{id}/confidence` | Submit post-counselling confidence score |
 | `GET` | `/counselling/sessions` | List counselling sessions |
@@ -330,9 +355,27 @@ interface ConsensusSummaryData {
   post_confidence_parent?: number;
   confidence_status?: 'opt_in_pending' | 'actual_delta_recorded';
   counselling_mode?: 'deterministic' | 'ai_grounded';
+  counselling_model?: string;                            // e.g. 'gemini-3.8-flash'
+  counselling_mode_note?: string;
   disclaimer: string;
   is_demo_data: boolean;
 }
+
+interface FamilyConsensusResult {
+  mode: 'live' | 'demo';
+  summary?: ConsensusSummaryData;
+  error?: string;
+  selectedModel?: string;
+}
+
+const AVAILABLE_GEMINI_MODELS = [
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', tag: 'Recommended (Deep RAG Reasoning)' },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', tag: 'Balanced' },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', tag: 'Low-Latency' },
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tag: 'Fast Inference' },
+] as const;
+
+type GeminiModelId = typeof AVAILABLE_GEMINI_MODELS[number]['id'];
 ```
 
 ### `PlatformAnalytics`
@@ -385,8 +428,17 @@ The RAG pipeline utilizes the following Google Gemini models:
 | Component | Model Identifier | API Endpoint / Method | Role & Description | Fallback Mechanism |
 |---|---|---|---|---|
 | **Course & Query Embeddings** | `gemini-embedding-2` | `models/gemini-embedding-2:batchEmbedContents`<br>`models/gemini-embedding-2:embedContent` | Ingestion & query vectorization (`taskType: RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`). Embeds course titles, descriptions, NSQF levels, eligibility, and curriculum highlights. | Pure-Python in-memory TF-IDF vectorizer + cosine similarity ranking (`_use_vectors=False`). |
-| **Consensus Report Synthesis** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze`). Produces structured JSON consensus summary, alignment scores, and unresolved concerns. | Deterministic `FamilyConsensusEngine.analyze_family()` rule engine. |
+| **Consensus Report Synthesis** | `gemini-3.8-flash` (default)<br>`gemini-3.6-flash`<br>`gemini-3.5-flash-lite`<br>`gemini-3.1-flash-lite` | `models/{model}:generateContent` | Grounded multi-perspective consensus generation (`POST /api/v1/families/{id}/analyze?model={model}&strict={strict}`). Synthesizes structured JSON consensus summary, alignment scores, discussion guide, and sets `counselling_model`. | When `strict=false`, falls back to deterministic `FamilyConsensusEngine.analyze_family()`. When `strict=true`, raises HTTP 502 with root-cause diagnostic error. |
 | **AI Counselling Enhancement** | `gemini-3.8-flash` | `models/gemini-3.8-flash:generateContent` | `AICounsellorAdapter.enhance_analysis()` contextual tone adaptation and actionable family dialogue tips. | Returns base deterministic analysis unchanged. |
+
+### Strict RAG Mode & Error Handling
+
+- **Query Parameter:** `strict: bool` on `POST /families/{id}/analyze` (default: `false` on backend, defaulted to `true` by frontend UI for evaluation)
+- **Model Parameter:** `model: str` on `POST /families/{id}/analyze` (default: `gemini-3.8-flash`)
+- **State & Storage:** Frontend tracks `selectedModel` (`skillsaathi_rag_model`) and `strictRAG` (`skillsaathi_strict_rag`) in `sessionStorage`
+- **Behavior:**
+  - **Strict Mode (`strict=true`):** If Gemini API fails (missing key, quota exhaustion, HTTP errors, or schema decode failures), backend returns HTTP 502 Bad Gateway with diagnostic error details. The UI halts and renders an error banner with a retry dropdown for testing alternate models, plus a manual bypass to view deterministic consensus fallback.
+  - **Permissive Mode (`strict=false`):** Any Gemini failure silently falls back to the deterministic consensus engine (`counselling_mode: 'deterministic'`).
 
 ### UI Data Gap Surfacing
 
