@@ -28,6 +28,8 @@ import { Button } from '../../components/common/Button';
 import { Badge } from '../../components/common/Badge';
 import { CounsellorRequestForm } from './CounsellorRequestForm';
 import { familyConsensusService, FamilyConsensusResult, AVAILABLE_GEMINI_MODELS } from '../../services/api/familyConsensusService';
+import { NCrFCreditLadder } from '../career-pathways/NCrFCreditLadder';
+import { ChatMessage } from './ChatMessage';
 
 export interface AssessmentResultsProps {
   results: AssessmentResultsData;
@@ -72,8 +74,8 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
   const [selectedModel, setSelectedModel] = useState<string>(
     initialModel ||
     (typeof window !== 'undefined' && window.sessionStorage
-      ? window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-3.8-flash'
-      : 'gemini-3.8-flash')
+      ? window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-flash-lite-latest'
+      : 'gemini-flash-lite-latest')
   );
 
   const [strictRAG, setStrictRAG] = useState<boolean>(
@@ -1066,6 +1068,58 @@ export const AssessmentResults: React.FC<AssessmentResultsProps> = ({
               </span>
             )}
           </div>
+        )}
+
+        {/* Multi-Agent Dialogue Log (LangGraph Turn-Taking) */}
+        {consensusResult?.summary?.agent_dialogue && consensusResult.summary.agent_dialogue.length > 0 && (
+          <div
+            style={{
+              backgroundColor: '#f8fafc',
+              border: '1px solid #e2e8f0',
+              borderRadius: '12px',
+              padding: '1.25rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '1rem',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #e2e8f0', paddingBottom: '0.75rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <Users size={18} style={{ color: '#2563eb' }} />
+                <h3 style={{ fontSize: '1rem', fontWeight: 700, margin: 0, color: '#0f172a' }}>
+                  {isHi ? 'मल्टी-एजेंट परिवार मध्यस्थता संवाद (LangGraph)' : isMr ? 'मल्टी-एजंट कुटुंब संवाद चर्चा (LangGraph)' : 'Multi-Agent Family Mediation Dialogue (LangGraph)'}
+                </h3>
+              </div>
+              <Badge variant="primary" size="sm">
+                4 Specialized Agents
+              </Badge>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              {consensusResult.summary.agent_dialogue.map((turn, tIdx) => (
+                <ChatMessage
+                  key={tIdx}
+                  message={{
+                    id: `agent-turn-${tIdx}`,
+                    sessionId: consensusResult.summary?.family_id || 'active',
+                    senderRole: turn.name.toLowerCase().includes('parent') ? 'parent' : 'counsellor',
+                    senderName: turn.name,
+                    content: turn.content,
+                    timestamp: 'Verified Agent Turn',
+                    language: language,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* NCrF Credit Progression Ladder Component */}
+        {consensusResult?.summary && (
+          <NCrFCreditLadder
+            currentLevel={consensusResult.summary.top_pathway_recommendations?.[0]?.nsqf_level || 4}
+            highlightStream={consensusResult.summary.top_pathway_recommendations?.[0]?.stream || 'Technical Vocational'}
+          />
         )}
 
         {/* Stated Priorities Comparison (Student vs Parent) */}

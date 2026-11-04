@@ -184,6 +184,36 @@ class ConsensusSummaryResponse(BaseModel):
     counselling_mode_note: str = "Evaluated using SkillSaathi Evidence-Grounded Consensus Engine."
     disclaimer: str
     is_demo_data: bool = True
+    agent_dialogue: Optional[List[Dict[str, Any]]] = None
+    verified_facts: Optional[List[Dict[str, Any]]] = None
+
+# --- Multi-Agent Chat & HITL Schemas ---
+
+class AgentMessageSchema(BaseModel):
+    name: str
+    role: str
+    content: str
+    timestamp: Optional[datetime] = None
+
+class FamilyChatRequest(BaseModel):
+    sender: str = Field(..., description="student, parent, or human_counsellor")
+    message: str = Field(..., min_length=1, max_length=1000)
+
+class FamilyChatResponse(BaseModel):
+    family_id: str
+    messages: List[AgentMessageSchema]
+    latest_response: Optional[str] = None
+    consensus_readiness: Optional[str] = None
+    next_speaker: Optional[str] = None
+
+class CounsellorResumeRequest(BaseModel):
+    counsellor_notes: str = Field(..., min_length=5, description="Expert guidance or resolution note from human counsellor")
+
+class CounsellorResumeResponse(BaseModel):
+    family_id: str
+    status: str
+    message: str
+    resumed_readiness: Optional[str] = None
 
 class ConfidenceSubmission(BaseModel):
     role: str = Field("student", description="student, parent, or joint")

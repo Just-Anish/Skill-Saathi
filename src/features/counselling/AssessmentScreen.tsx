@@ -41,9 +41,9 @@ export const AssessmentScreen: React.FC<AssessmentScreenProps> = ({
 
   const [selectedRAGModel, setSelectedRAGModel] = useState<string>(() => {
     if (typeof window !== 'undefined' && window.sessionStorage) {
-      return window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-3.8-flash';
+      return window.sessionStorage.getItem('skillsaathi_rag_model') || 'gemini-flash-lite-latest';
     }
-    return 'gemini-3.8-flash';
+    return 'gemini-flash-lite-latest';
   });
 
   const [strictRAG, setStrictRAG] = useState<boolean>(() => {

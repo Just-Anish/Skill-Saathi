@@ -1,8 +1,10 @@
 import uuid
+import logging
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
+from langchain_core.messages import HumanMessage
 
 from .database import get_db
 from .models import FamilySessionModel, CourseModel, CounsellorEscalationModel
@@ -22,11 +24,25 @@ from .schemas import (
     AnalyticsOverviewResponse,
     AnalyticsOverviewMetric,
     ParentalResistanceAnalyticsResponse,
-    ParentalResistanceTopic
+    ParentalResistanceTopic,
+    FamilyChatRequest,
+    FamilyChatResponse,
+    AgentMessageSchema,
+    CounsellorResumeRequest,
+    CounsellorResumeResponse
 )
 from .consensus_engine import FamilyConsensusEngine
 from .rag_retriever import course_vector_store, build_rag_query
 from .rag_generator import generate_rag_consensus
+from .agents.graph import (
+    run_family_counselling,
+    get_counselling_state,
+    resume_counselling_session,
+    counselling_graph
+)
+from .agents.llm import extract_text_content
+
+logger = logging.getLogger("skillsaathi.routes")
 
 router = APIRouter(tags=["SkillSaathi API"])
 
@@ -233,7 +249,7 @@ def list_courses(
 @router.post("/families/{family_id}/analysis", response_model=ConsensusSummaryResponse, status_code=status.HTTP_200_OK)
 def analyze_family_consensus(
     family_id: str,
-    model: str = Query("gemini-3.8-flash", description="Gemini model for RAG synthesis"),
+    model: str = Query("gemini-flash-lite-latest", description="Gemini model for RAG synthesis"),
     strict: bool = Query(False, description="If True, returns 502/error on Gemini failure instead of falling back"),
     db: Session = Depends(get_db)
 ):
@@ -313,23 +329,48 @@ def analyze_family_consensus(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 3: RAG Generation — Gemini enhances with retrieved context    #
+    # Step 3: Multi-Agent LangGraph Orchestration                        #
     # ------------------------------------------------------------------ #
-    rag_enhanced, rag_error = generate_rag_consensus(
-        family_id=family_id,
-        student=student,
-        parent=parent,
-        retrieved_courses=retrieved_courses,
-        base_analysis=analysis,
-        model_name=model,
-    )
-    if strict and rag_error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gemini RAG Generation Failed using [{model}]: {rag_error}",
+    try:
+        graph_result = run_family_counselling(
+            family_id=family_id,
+            student_profile=student,
+            parent_profile=parent,
+            courses=courses_dict_list,
+            thread_id=family_id,
+            model_name=model,
+            strict=strict
         )
-    if rag_enhanced:
-        analysis = rag_enhanced
+        if graph_result and graph_result.get("final_consensus_summary"):
+            analysis = graph_result["final_consensus_summary"]
+            
+            # Format agent dialogue for inspectability
+            dialogue = []
+            for msg in graph_result.get("messages", []):
+                dialogue.append({
+                    "name": getattr(msg, "name", "Agent") or "Agent",
+                    "role": getattr(msg, "type", "ai"),
+                    "content": extract_text_content(msg.content)
+                })
+            analysis["agent_dialogue"] = dialogue
+            analysis["verified_facts"] = graph_result.get("verified_facts", [])
+    except Exception as graph_err:
+        logger.warning("[Routes] Multi-agent execution error: %s", graph_err)
+        if strict:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Multi-Agent LangGraph failed using [{model}]: {str(graph_err)}"
+            )
+        rag_enhanced, rag_error = generate_rag_consensus(
+            family_id=family_id,
+            student=student,
+            parent=parent,
+            retrieved_courses=retrieved_courses,
+            base_analysis=analysis,
+            model_name=model,
+        )
+        if rag_enhanced:
+            analysis = rag_enhanced
 
     # If post-confidence was previously submitted, preserve it
     if family.post_confidence_student is not None or family.post_confidence_parent is not None:
@@ -689,3 +730,122 @@ def get_parental_resistance_analytics(db: Session = Depends(get_db)):
         district_insights=district_data,
         disclaimer=f"Aggregated solely from participating family sessions (n = {total_sessions}); small-group cohorts (<5) suppressed for privacy. Not a census-level population survey."
     )
+
+
+# --- 11. Multi-Party Interactive Chat Turn (LangGraph) ---
+@router.post("/families/{family_id}/chat", response_model=FamilyChatResponse, status_code=status.HTTP_200_OK)
+def family_chat_turn(
+    family_id: str,
+    payload: FamilyChatRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Participate in a multi-turn family mediation chat session.
+    Sends a message as student, parent, or counselor into the LangGraph thread.
+    """
+    family = db.query(FamilySessionModel).filter(FamilySessionModel.id == family_id).first()
+    if not family:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Family session '{family_id}' not found."
+        )
+
+    config = {"configurable": {"thread_id": family_id}}
+    human_msg = HumanMessage(content=payload.message, name=payload.sender)
+
+    try:
+        updated_state = counselling_graph.invoke(
+            {"messages": [human_msg]},
+            config=config
+        )
+        raw_messages = updated_state.get("messages", [])
+        formatted_messages = [
+            AgentMessageSchema(
+                name=getattr(m, "name", "Participant") or "Participant",
+                role=getattr(m, "type", "chat"),
+                content=extract_text_content(m.content)
+            )
+            for m in raw_messages
+        ]
+        latest_reply = formatted_messages[-1].content if formatted_messages else None
+
+        return FamilyChatResponse(
+            family_id=family_id,
+            messages=formatted_messages,
+            latest_response=latest_reply,
+            consensus_readiness=updated_state.get("consensus_readiness"),
+            next_speaker=updated_state.get("next_speaker")
+        )
+    except Exception as exc:
+        logger.warning("[ChatTurn] Error invoking chat turn: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process chat turn: {str(exc)}"
+        )
+
+
+# --- 12. Resume Interrupted Session after Counsellor Intervention ---
+@router.post("/families/{family_id}/resume", response_model=CounsellorResumeResponse, status_code=status.HTTP_200_OK)
+def resume_counselling_turn(
+    family_id: str,
+    payload: CounsellorResumeRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Resumes an interrupted session after a human counselor leaves expert guidance.
+    Unblocks the LangGraph HITL pause node.
+    """
+    family = db.query(FamilySessionModel).filter(FamilySessionModel.id == family_id).first()
+    if not family:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Family session '{family_id}' not found."
+        )
+
+    try:
+        resumed = resume_counselling_session(
+            thread_id=family_id,
+            counsellor_notes=payload.counsellor_notes
+        )
+        readiness = (
+            (resumed.get("final_consensus_summary") or {}).get("overall_consensus_readiness")
+            or resumed.get("consensus_readiness")
+            or "moderate"
+        )
+        return CounsellorResumeResponse(
+            family_id=family_id,
+            status="resumed",
+            message="Session successfully resumed with human counselor guidance.",
+            resumed_readiness=readiness
+        )
+    except Exception as exc:
+        logger.warning("[ResumeTurn] Error resuming session: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resume session: {str(exc)}"
+        )
+
+
+# --- 13. Live WebSocket Streaming Endpoint ---
+@router.websocket("/families/{family_id}/stream")
+async def websocket_counselling_stream(websocket: WebSocket, family_id: str):
+    """
+    Live WebSocket stream for real-time multi-agent token and event broadcasting.
+    """
+    await websocket.accept()
+    try:
+        await websocket.send_json({
+            "event": "connected",
+            "family_id": family_id,
+            "message": "Connected to SkillSaathi Multi-Agent Live Stream."
+        })
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_json({
+                "event": "message_received",
+                "content": data
+            })
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        await websocket.close()
