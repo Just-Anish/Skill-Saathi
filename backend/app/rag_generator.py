@@ -31,6 +31,8 @@ Public surface (unchanged):
 
 from __future__ import annotations
 
+from langchain_ollama import ChatOllama
+
 import json
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
@@ -407,12 +409,14 @@ def master_counselor_node(state: ConsensusState) -> ConsensusState:
     prompt_text = _build_master_counselor_prompt(state)
 
     try:
-        llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=settings.GEMINI_API_KEY,
-            temperature=0.2,
-            max_output_tokens=4096,
-        )
+        # llm = ChatGoogleGenerativeAI(
+        #     model=model_name,
+        #     google_api_key=settings.GEMINI_API_KEY,
+        #     temperature=0.2,
+        #     max_output_tokens=4096,
+        # )
+        llm = ChatOllama(model="llama3.2", temperature=0)
+        
         response = llm.invoke([
             SystemMessage(content=_MASTER_COUNSELOR_SYSTEM),
             HumanMessage(content=prompt_text),
@@ -459,12 +463,14 @@ def generator_node(state: ConsensusState) -> ConsensusState:
     prompt_text = _build_retry_prompt(state)
 
     try:
-        llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=settings.GEMINI_API_KEY,
-            temperature=0.25,
-            max_output_tokens=4096,
-        )
+        # llm = ChatGoogleGenerativeAI(
+        #     model=model_name,
+        #     google_api_key=settings.GEMINI_API_KEY,
+        #     temperature=0.25,
+        #     max_output_tokens=4096,
+        # )
+        llm = ChatOllama(model="llama3.2", temperature=0)
+
         response = llm.invoke([
             SystemMessage(content=_RETRY_SYSTEM),
             HumanMessage(content=prompt_text),

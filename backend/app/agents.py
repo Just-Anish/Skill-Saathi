@@ -18,6 +18,7 @@ persona system prompts grounded in Indian vocational education realities.
 
 from __future__ import annotations
 
+from langchain_ollama import ChatOllama
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -120,11 +121,13 @@ def student_advocate_agent(
             f"Fostering intrinsic passion here will yield greater technical mastery and career longevity."
         )
 
-    llm = ChatGoogleGenerativeAI(
-        model=model_name,
-        google_api_key=settings.GEMINI_API_KEY.strip(),
-        max_output_tokens=1024,
-    )
+    # llm = ChatGoogleGenerativeAI(
+    #     model=model_name,
+    #     google_api_key=settings.GEMINI_API_KEY.strip(),
+    #     max_output_tokens=1024,
+    # )
+
+    llm = ChatOllama(model="llama3.2", temperature=0)
 
     context = {
         "student_profile": {
@@ -188,11 +191,13 @@ def parent_advocate_agent(
             f"accreditation (NCVET/DGT) with clear placement pathways."
         )
 
-    llm = ChatGoogleGenerativeAI(
-        model=model_name,
-        google_api_key=settings.GEMINI_API_KEY.strip(),
-        max_output_tokens=1024,
-    )
+    # llm = ChatGoogleGenerativeAI(
+    #     model=model_name,
+    #     google_api_key=settings.GEMINI_API_KEY.strip(),
+    #     max_output_tokens=1024,
+    # )
+
+    llm = ChatOllama(model="llama3.2", temperature=0)
 
     context = {
         "parent_profile": {
