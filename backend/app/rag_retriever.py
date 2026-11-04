@@ -14,6 +14,10 @@ import urllib.error
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
+from rank_bm25 import BM25Okapi
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+
 from .config import settings
 
 logger = logging.getLogger("skillsaathi.rag")
@@ -296,6 +300,7 @@ class CourseVectorStore:
         self._courses: List[Dict[str, Any]] = []
         self._embeddings: Optional[List[List[float]]] = None
         self._tfidf: _TFIDFIndex = _TFIDFIndex()
+        self._bm25: Optional[BM25Okapi] = None
         self._documents: List[str] = []
         self._ready: bool = False
         self._use_vectors: bool = False
@@ -303,7 +308,7 @@ class CourseVectorStore:
     # ------------------------------------------------------------------
     def build(self, courses: List[Dict[str, Any]]) -> None:
         """
-        Ingest courses and build the retrieval index.
+        Ingest courses and build the hybrid retrieval index (BM25 + Dense Vectors).
         Called at application startup once courses are seeded into the DB.
         """
         if not courses:
@@ -313,22 +318,31 @@ class CourseVectorStore:
         self._courses = courses
         self._documents = [_course_to_document(c) for c in courses]
 
-        # Always build TF-IDF as reliable fallback
+        # 1. Build TF-IDF baseline fallback
         self._tfidf.build(self._documents)
 
-        # Attempt Gemini-based dense embeddings
+        # 2. Build BM25 index for exact trade/accreditation keywords
+        try:
+            tokenized_corpus = [_tokenize(doc) for doc in self._documents]
+            if tokenized_corpus:
+                self._bm25 = BM25Okapi(tokenized_corpus)
+        except Exception as bm25_err:
+            logger.warning("[RAG] BM25 indexing skipped: %s", bm25_err)
+            self._bm25 = None
+
+        # 3. Attempt Gemini-based dense embeddings
         embeddings = _embed_via_gemini(self._documents)
         if embeddings:
             self._embeddings = embeddings
             self._use_vectors = True
             logger.info(
-                "[RAG] Vector store built with Gemini embeddings for %d courses.",
+                "[RAG] Hybrid store built with Gemini embeddings & BM25 for %d courses.",
                 len(courses),
             )
         else:
             self._use_vectors = False
             logger.info(
-                "[RAG] Vector store built with TF-IDF fallback for %d courses "
+                "[RAG] Hybrid store built with BM25/TF-IDF fallback for %d courses "
                 "(set GEMINI_API_KEY for dense vector retrieval).",
                 len(courses),
             )
@@ -343,29 +357,56 @@ class CourseVectorStore:
         student: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve the top_k most relevant courses for the given query.
+        Retrieve the top_k most relevant courses using Hybrid Ranking (Dense + BM25).
         Optionally filters by student education eligibility.
-
         Returns a list of course dicts augmented with a `_rag_score` field.
         """
         if not self._ready:
             logger.warning("[RAG] Store not built; returning empty list.")
             return []
 
+        q_tokens = _tokenize(query)
+        bm25_scores = (
+            self._bm25.get_scores(q_tokens)
+            if self._bm25 and q_tokens
+            else [0.0] * len(self._courses)
+        )
+        max_bm25 = max(bm25_scores) if len(bm25_scores) > 0 and max(bm25_scores) > 0 else 1.0
+        normalized_bm25 = [s / max_bm25 for s in bm25_scores]
+
         if self._use_vectors:
             q_emb = _embed_query_gemini(query)
             if q_emb:
-                scored = [
-                    (_cosine(q_emb, emb), idx)
-                    for idx, emb in enumerate(self._embeddings)  # type: ignore[arg-type]
-                ]
+                # Hybrid fusion: 60% dense cosine + 40% BM25 keyword
+                scored = []
+                for idx, emb in enumerate(self._embeddings):  # type: ignore[arg-type]
+                    cos_sim = max(0.0, _cosine(q_emb, emb))
+                    bm_score = normalized_bm25[idx] if idx < len(normalized_bm25) else 0.0
+                    hybrid_score = (0.6 * cos_sim) + (0.4 * bm_score)
+                    scored.append((hybrid_score, idx))
+
                 scored.sort(reverse=True)
-                indices = [idx for _, idx in scored[:top_k * 2]]  # over-fetch for eligibility filter
+                indices = [idx for _, idx in scored[:top_k * 2]]
             else:
-                # Gemini query embed failed at runtime; fall through to TF-IDF
-                indices = self._tfidf.query(query, top_k * 2)
+                # Query embed failed; use BM25 or TF-IDF
+                if self._bm25 and any(s > 0 for s in bm25_scores):
+                    scored_bm = sorted(
+                        [(score, idx) for idx, score in enumerate(bm25_scores)],
+                        reverse=True
+                    )
+                    indices = [idx for _, idx in scored_bm[:top_k * 2]]
+                else:
+                    indices = self._tfidf.query(query, top_k * 2)
         else:
-            indices = self._tfidf.query(query, top_k * 2)
+            # Dense vectors not configured: use BM25 with TF-IDF fallback
+            if self._bm25 and any(s > 0 for s in bm25_scores):
+                scored_bm = sorted(
+                    [(score, idx) for idx, score in enumerate(bm25_scores)],
+                    reverse=True
+                )
+                indices = [idx for _, idx in scored_bm[:top_k * 2]]
+            else:
+                indices = self._tfidf.query(query, top_k * 2)
 
         results: List[Dict[str, Any]] = []
         for idx in indices:
@@ -394,7 +435,30 @@ class CourseVectorStore:
         """Re-ingest when course catalog changes."""
         self.build(courses)
 
+    def as_langchain_retriever(self, top_k: int = 3) -> "LangChainCourseRetriever":
+        """Wrap this vector store as a LangChain BaseRetriever."""
+        return LangChainCourseRetriever(store=self, top_k=top_k)
+
+
+# ---------------------------------------------------------------------------
+# LangChain BaseRetriever Adapter
+# ---------------------------------------------------------------------------
+
+class LangChainCourseRetriever(BaseRetriever):
+    """Adapter bridging SkillSaathi CourseVectorStore into LangChain agents."""
+    store: Any = None
+    top_k: int = 3
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        if not self.store:
+            return []
+        courses = self.store.retrieve(query=query, top_k=self.top_k)
+        docs = []
+        for c in courses:
+            content = _course_to_document(c)
+            docs.append(Document(page_content=content, metadata=c))
+        return docs
+
 
 # Singleton instance — imported and used across the application
 course_vector_store = CourseVectorStore()
-

@@ -96,32 +96,35 @@ export interface ConsensusSummaryData {
   counselling_mode_note?: string;
   disclaimer: string;
   is_demo_data: boolean;
+  agent_dialogue?: Array<{
+    name: string;
+    role: string;
+    content: string;
+  }>;
+  verified_facts?: Array<{
+    category: string;
+    data: any;
+  }>;
 }
 
 export const AVAILABLE_GEMINI_MODELS = [
   {
-    id: 'gemini-3.8-flash',
-    name: 'Gemini 3.8 Flash',
-    tag: 'Recommended (Deep RAG Reasoning)',
-    description: 'High-capability reasoning model for grounded evidence synthesis and dialogue planning.',
-  },
-  {
-    id: 'gemini-3.6-flash',
-    name: 'Gemini 3.6 Flash',
-    tag: 'Balanced',
-    description: 'Fast, balanced generative model for career analysis.',
-  },
-  {
-    id: 'gemini-3.5-flash-lite',
-    name: 'Gemini 3.5 Flash Lite',
-    tag: 'Low-Latency',
-    description: 'Lightweight, ultra-fast model with minimal latency.',
+    id: 'gemini-flash-lite-latest',
+    name: 'Gemini Flash Lite (Active Quota)',
+    tag: 'Recommended (Fast & Active)',
+    description: 'Ultra-fast, responsive Google Gemini model with active free-tier quota.',
   },
   {
     id: 'gemini-3.1-flash-lite',
     name: 'Gemini 3.1 Flash Lite',
-    tag: 'Fast Inference',
-    description: 'Cost-efficient flash lite model for streamlined extraction.',
+    tag: 'Low-Latency',
+    description: 'High-speed model optimized for rapid multi-agent turn taking.',
+  },
+  {
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
+    tag: 'Deep Reasoning',
+    description: 'Extended reasoning model for grounded evidence synthesis.',
   },
 ] as const;
 
@@ -188,6 +191,53 @@ class FamilyConsensusService {
       }
     } catch (err) {
       console.warn('[SkillSaathi] Failed to submit post-confidence to backend:', err);
+    }
+    return null;
+  }
+
+  /**
+   * Send an interactive chat turn to the LangGraph multi-agent backend
+   */
+  async sendChatMessage(
+    familyId: string,
+    sender: 'student' | 'parent' | 'counsellor',
+    message: string
+  ): Promise<{
+    family_id: string;
+    messages: Array<{ name: string; role: string; content: string }>;
+    latest_response?: string;
+    consensus_readiness?: string;
+  } | null> {
+    try {
+      const isLive = await this.checkHealth();
+      if (isLive) {
+        return await apiClient.post(ENDPOINTS.FAMILIES.CHAT(familyId), {
+          sender,
+          message,
+        });
+      }
+    } catch (err) {
+      console.warn('[SkillSaathi] Failed to send chat message:', err);
+    }
+    return null;
+  }
+
+  /**
+   * Resume an interrupted session with expert counselor guidance
+   */
+  async resumeSession(
+    familyId: string,
+    counsellorNotes: string
+  ): Promise<{ status: string; message: string; resumed_readiness?: string } | null> {
+    try {
+      const isLive = await this.checkHealth();
+      if (isLive) {
+        return await apiClient.post(ENDPOINTS.FAMILIES.RESUME(familyId), {
+          counsellor_notes: counsellorNotes,
+        });
+      }
+    } catch (err) {
+      console.warn('[SkillSaathi] Failed to resume session:', err);
     }
     return null;
   }
